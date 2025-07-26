@@ -13,7 +13,19 @@ if not os.path.exists("service_account.json"):
 import inspect, json, logging, re, time
 from functools import lru_cache
 from itertools import groupby
-
+import gspread
+from google.oauth2.service_account import Credentials
+def log_to_sheet(user_id, username, message, timestamp):
+    try:
+        creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+        creds_dict = json.loads(creds_json)
+        creds = Credentials.from_service_account_info(creds_dict, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+        gc = gspread.authorize(creds)
+        sh = gc.open_by_key('11dG_R527d6toFdcgxtyyykxYjVZzodg05TLtQidDCHo')  # <-- ВСТАВЬ СЮДА ID таблицы из адреса
+        ws = sh.sheet1  # или по имени: sh.worksheet('Лист1')
+        ws.append_row([str(user_id), username, message, timestamp])
+    except Exception as e:
+        print("Ошибка логирования в Google Sheets:", e)
 try:
     from unidecode import unidecode
 except ModuleNotFoundError:
@@ -538,8 +550,14 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.message.text or ""
-    logger.info("⇢ %s", q)
+    user = update.effective_user
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    username = user.username or ""
+    user_id = user.id
+    # Добавляем логирование в Google Sheets
+    log_to_sheet(user_id, username, q, timestamp)
 
+    logger.info("⇢ %s", q)
     punkts = merge_bullets(rag_search(q))[:45]
     logger.info("Нашли пунктов: %d", len(punkts))
 
@@ -558,6 +576,7 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     for chunk in [answer[i:i+3900] for i in range(0, len(answer), 3900)]:
         await update.message.reply_text(fix_unclosed_tags(chunk), parse_mode="HTML")
+
 
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
