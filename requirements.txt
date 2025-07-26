@@ -1,0 +1,7 @@
+python-telegram-bot
+openai
+python-dotenv
+beautifulsoup4
+numpy
+unidecode
+pyspellchecker
