@@ -550,6 +550,27 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML"
     )
 
+def build_human_friendly(q, punkts, official_answer):
+    prompt = (
+        f"Вопрос: {q}\n"
+        "Ответь на этот вопрос кратко, простыми словами для обычного человека, "
+        "без официальных формулировок и бюрократического языка. Если вопрос о процедуре — опиши коротко основные шаги. "
+        "Опирайся на официальный ответ ниже.\n\n"
+        f"Официальный ответ:\n{official_answer}\n\n"
+        "Твой короткий разъясняющий ответ:"
+    )
+    try:
+        response = openai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=200,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        print("Ошибка генерации human-friendly ответа:", e)
+        return "(Краткое объяснение не сгенерировано)"
+
 async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.message.text or ""
     user = update.effective_user
@@ -567,11 +588,19 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         answer = ask_llm(f"{q}\n\n{followup}", punkts)
         answer = postprocess_answer(q, punkts, answer)
-  
-    logger.info(f"Вопрос: {q}\nПункты, подобранные RAG: {[p['punkt_num'] for p in punkts]}")
-    logger.info(f"Ответ LLM:\n{answer}")
 
-    for chunk in [answer[i:i+3900] for i in range(0, len(answer), 3900)]:
+    # --- Human-friendly summary ---
+    human_friendly = build_human_friendly(q, punkts, answer)
+
+    final_answer = (
+        f"💡 <b>Кратко:</b>\n{human_friendly}\n\n"
+        f"<b>Официальный ответ по Правилам:</b>\n{answer}"
+    )
+
+    logger.info(f"Вопрос: {q}\nПункты, подобранные RAG: {[p['punkt_num'] for p in punkts]}")
+    logger.info(f"Ответ LLM (гибрид):\n{final_answer}")
+
+    for chunk in [final_answer[i:i+3900] for i in range(0, len(final_answer), 3900)]:
         await update.message.reply_text(fix_unclosed_tags(chunk), parse_mode="HTML")
 
     # ----- Логирование -----
@@ -581,7 +610,7 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         user_id=user.id if user else "",
         username=user.username if user and user.username else "",
         message=q,
-        bot_answer=answer,
+        bot_answer=final_answer,
         timestamp=timestamp
     )
 
