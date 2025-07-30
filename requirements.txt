@@ -1,4 +1,4 @@
-python-telegram-bot
+python-telegram-bot[webhooks]
 openai
 python-dotenv
 beautifulsoup4
@@ -7,4 +7,3 @@ unidecode
 pyspellchecker
 gspread
 google-auth
-
