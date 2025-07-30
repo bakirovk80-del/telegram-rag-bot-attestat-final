@@ -7,3 +7,4 @@ unidecode
 pyspellchecker
 gspread
 google-auth
+aiohttp
