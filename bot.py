@@ -47,6 +47,7 @@ if not hasattr(inspect, "getargspec"):
     inspect.getargspec = lambda f: inspect.getfullargspec(f)[:4]
 
 from config_maps import UNIVERSAL_MAP
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -58,6 +59,8 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger("rag-telegram-bot")
+# user_id : (question, punkts, human_friendly, official_answer)
+LAST_QA = {}
 
 PUNKT_EMBS_PATH = "embeddings.npy"
 PUNKT_JSON_PATH = "pravila_detailed_tagged_autofix.json"
@@ -579,45 +582,77 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     punkts = merge_bullets(rag_search(q))[:45]
     logger.info("Нашли пунктов: %d", len(punkts))
 
-    answer = ask_llm(q, punkts) if punkts else "Прямого ответа не найдено."
-    answer = postprocess_answer(q, punkts, answer)
-    if "<b>Условия/критерии:</b>" in answer and answer.count("–") < 5:
-        followup = (
-            "В разделе «Условия/критерии» перечислены не все пункты. "
-            "Пожалуйста, дополни полный перечень без сокращений."
-        )
-        answer = ask_llm(f"{q}\n\n{followup}", punkts)
-        answer = postprocess_answer(q, punkts, answer)
+    # Получаем оба ответа
+    official_answer = ask_llm(q, punkts) if punkts else "Прямого ответа не найдено."
+    official_answer = postprocess_answer(q, punkts, official_answer)
+    human_friendly = build_human_friendly(q, punkts, official_answer)
 
-    # --- Human-friendly summary ---
-    human_friendly = build_human_friendly(q, punkts, answer)
+    # Сохраняем последний вопрос пользователя (user.id)
+    LAST_QA[user.id] = (q, punkts, human_friendly, official_answer)
 
-    final_answer = (
-        f"💡 <b>Кратко:</b>\n{human_friendly}\n\n"
-        f"<b>Официальный ответ по Правилам:</b>\n{answer}"
+    # Формируем human-friendly сообщение с кнопкой
+    reply_text = (
+        f"💡 <b>Кратко, простыми словами:</b>\n{human_friendly}\n\n"
+        f"<i>Для официального ответа с цитатами Правил — нажмите кнопку ниже.</i>"
+    )
+    keyboard = [
+        [InlineKeyboardButton("Показать официальный ответ", callback_data="show_official")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        fix_unclosed_tags(reply_text),
+        parse_mode="HTML",
+        reply_markup=reply_markup
     )
 
-    logger.info(f"Вопрос: {q}\nПункты, подобранные RAG: {[p['punkt_num'] for p in punkts]}")
-    logger.info(f"Ответ LLM (гибрид):\n{final_answer}")
-
-    for chunk in [final_answer[i:i+3900] for i in range(0, len(final_answer), 3900)]:
-        await update.message.reply_text(fix_unclosed_tags(chunk), parse_mode="HTML")
-
-    # ----- Логирование -----
+    # Логируем human-friendly ответ (официальный залогируется после кнопки)
     import datetime
     timestamp = datetime.datetime.now().isoformat(sep=' ', timespec='seconds')
     log_to_sheet(
         user_id=user.id if user else "",
         username=user.username if user and user.username else "",
         message=q,
-        bot_answer=final_answer,
+        bot_answer=human_friendly,
         timestamp=timestamp
     )
+async def button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+    await query.answer()
+
+    if query.data == "show_official":
+        qa = LAST_QA.get(user.id)
+        if qa:
+            q, punkts, human_friendly, official_answer = qa
+            reply_text = f"<b>Официальный ответ по Правилам:</b>\n{official_answer}"
+
+            await query.message.reply_text(
+                fix_unclosed_tags(reply_text),
+                parse_mode="HTML"
+            )
+
+            # Логируем официальный ответ
+            import datetime
+            timestamp = datetime.datetime.now().isoformat(sep=' ', timespec='seconds')
+            log_to_sheet(
+                user_id=user.id if user else "",
+                username=user.username if user and user.username else "",
+                message=f"[Официальный ответ на] {q}",
+                bot_answer=official_answer,
+                timestamp=timestamp
+            )
+        else:
+            await query.message.reply_text("Официальный ответ не найден.")
 
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
+    # Добавляем обработчик callback-кнопок:
+    from telegram.ext import CallbackQueryHandler
+    app.add_handler(CallbackQueryHandler(button))
     logger.info("Бот запущен.")
     app.run_polling()
+
 # ──────────────  конец файла  ──────────────
