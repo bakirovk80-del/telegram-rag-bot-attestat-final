@@ -684,7 +684,7 @@ async def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
     app.add_handler(CallbackQueryHandler(button))
     logger.info("Бот запущен через webhook.")
-
+    await app.initialize()
     # Создаем aiohttp веб-сервер для Telegram
     web_app = web.Application()
     web_app['bot'] = app
