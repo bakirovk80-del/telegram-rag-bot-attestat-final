@@ -49,25 +49,36 @@ APPEAL_RESP_MAP = {
     "ответствен": {"punkt_num": "46", "subpunkt_num": ""},
 }
 
-# 7. Льготы / освобождения (п. 29)
+# 7. Льготы / освобождения (п. 29, 30)
 EXEMPTION_MAP = {
-    "пенси":         {"punkt_num": "29", "subpunkt_num": ""},
-    "пенсион":       {"punkt_num": "29", "subpunkt_num": ""},
-    "беремен":       {"punkt_num": "29", "subpunkt_num": ""},
+    "пенси": {"punkt_num": "30", "subpunkt_num": ""},
+    "пенсион": {"punkt_num": "30", "subpunkt_num": ""},
+    "беремен": {"punkt_num": "29", "subpunkt_num": ""},
     "нетрудоспособ": {"punkt_num": "29", "subpunkt_num": ""},
-    "воинск":        {"punkt_num": "29", "subpunkt_num": ""},
-    "отпуск":        {"punkt_num": "29", "subpunkt_num": ""},
+    "воинск": {"punkt_num": "29", "subpunkt_num": ""},
+    "отпуск": {"punkt_num": "29", "subpunkt_num": ""},
+    "освобождени": {"punkt_num": "29", "subpunkt_num": ""},
+    "декрет": {"punkt_num": "29", "subpunkt_num": ""},
+    "отсрочк": {"punkt_num": "29", "subpunkt_num": ""},
+    "приостанов": {"punkt_num": "29", "subpunkt_num": ""},
 }
 
-# 8. Льготы «Болашақ» (п. 32) и иностранные сертификаты
+# 8. Льготы «Болашақ» и иностранные сертификаты (п. 32)
 BOLASHAQ_MAP = {
-    "болаш":      {"punkt_num": "32", "subpunkt_num": ""},
-    "bolash":     {"punkt_num": "32", "subpunkt_num": ""},
+    "болаш": {"punkt_num": "32", "subpunkt_num": ""},
+    "bolash": {"punkt_num": "32", "subpunkt_num": ""},
     "nazarbayev": {"punkt_num": "32", "subpunkt_num": ""},
-    "celtа":      {"punkt_num": "32", "subpunkt_num": ""},
-    "delta":      {"punkt_num": "32", "subpunkt_num": ""},
-    "phd":        {"punkt_num": "32", "subpunkt_num": ""},
+    "celta": {"punkt_num": "32", "subpunkt_num": ""},
+    "delta": {"punkt_num": "32", "subpunkt_num": ""},
+    "phd": {"punkt_num": "32", "subpunkt_num": ""},
+    "магистратура за рубежом": {"punkt_num": "32", "subpunkt_num": ""},
+    "зарубежная магистратура": {"punkt_num": "32", "subpunkt_num": ""},
+    "зарубежом магистратура": {"punkt_num": "32", "subpunkt_num": ""},
+    "иностранный диплом": {"punkt_num": "32", "subpunkt_num": ""},
+    "зарубежный вуз": {"punkt_num": "32", "subpunkt_num": ""},
+    "иностранный сертификат": {"punkt_num": "32", "subpunkt_num": ""},
 }
+
 
 # 9. Единая карта
 UNIVERSAL_MAP: dict[str, dict[str, str]] = {}
