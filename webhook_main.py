@@ -525,12 +525,54 @@ def ask_llm(q, punkts):
     return f"Не удалось получить ответ от LLM.\n\nВозможные фрагменты:\n{sample}"
 
 def postprocess_answer(q, punkts, answer):
-    # Универсальный постпроцессор для ответа:
-    # – Удаляет дубли пунктов/приложений между секциями.
-    # – Добавляет все пропущенные приложения в "Документы".
-    # – Если раздел отсутствует/пустой — вставляет 'Нет информации...'
-    # – Сортирует внутри секций по возрастанию номера.
+    # ---------- 1. Карта критических сценариев ----------
+    CRITICAL_PATTERNS = [
+        {
+            "name": "Болашак/иностранная магистратура",
+            "keywords": [r"магистратур", r"болашак", r"зарубеж", r"иностранн", r"nazarbayev", r"phd"],
+            "main_punkt": "32",
+            "fallback_punkts": ["5", "12"],
+            "warning": "В остальных случаях, не подпадающих под п. 32, аттестация проводится в общем порядке (см. п. 5)."
+        },
+        {
+            "name": "Пенсия/возраст/уход на пенсию",
+            "keywords": [r"пенси", r"возраст", r"пенсион", r"лет", r"старше"],
+            "main_punkt": "29",
+            "fallback_punkts": ["5"],
+            "warning": "В иных случаях освобождение по возрасту не предусмотрено, применяется общий порядок (см. п. 5)."
+        },
+        {
+            "name": "Досрочная/внеочередная аттестация",
+            "keywords": [r"досрочн", r"внеочередн", r"ускорен"],
+            "main_punkt": "31",
+            "fallback_punkts": ["5", "12"],
+            "warning": "Во всех остальных случаях применяется общий порядок присвоения категории (см. п. 5)."
+        },
+        {
+            "name": "Беременность/декрет/уход за ребенком",
+            "keywords": [r"беременн", r"декрет", r"уход за ребен", r"стажировк"],
+            "main_punkt": "30",
+            "fallback_punkts": ["5"],
+            "warning": "В иных случаях применяется общий порядок (см. п. 5)."
+        },
+        {
+            "name": "Апелляция/жалоба/оспаривание",
+            "keywords": [r"апелляц", r"жалоб", r"обжал", r"оспор", r"спорн"],
+            "main_punkt": "17",
+            "fallback_punkts": ["18", "20"],
+            "warning": "Если вопрос касается иных процедур, применяется общий порядок (см. п. 5)."
+        },
+        {
+            "name": "Нарушения/аннулирование",
+            "keywords": [r"наруш", r"аннулир", r"отказ", r"ответственн", r"санкц", r"отстран", r"дисквалификац", r"фальсификац", r"дисциплинарн", r"лишен", r"понижен"],
+            "main_punkt": "45",
+            "fallback_punkts": ["46", "47"],
+            "warning": "Во всех остальных случаях применяется общий порядок (см. п. 5)."
+        },
+        # Добавьте свои специфические сценарии ниже...
+    ]
 
+    # ---------- 2. Базовый постпроцессинг (как был) ----------
     all_punkt_nums = set(p["punkt_num"] for p in punkts if p["punkt_num"])
     all_apps = set(re.findall(r"Приложение\s?\d+", "\n".join([p["text"] for p in punkts])))
 
@@ -556,6 +598,67 @@ def postprocess_answer(q, punkts, answer):
     ]:
         if f"<b>{sec}:</b>" not in answer:
             answer += f"\n\n<b>{sec}:</b>\nНет информации по данному разделу."
+
+    # ---------- 3. Критический сценарий (гибридный режим) ----------
+    critical_match = None
+    for scenario in CRITICAL_PATTERNS:
+        if any(re.search(rx, q, re.I) for rx in scenario["keywords"]):
+            critical_match = scenario
+            break
+
+    if critical_match:
+        main_punkt = next((p for p in PUNKTS if p["punkt_num"] == critical_match["main_punkt"]), None)
+        fallback_punkts = [p for p in PUNKTS if p["punkt_num"] in critical_match["fallback_punkts"]]
+        warning = f"\n<b>⚠️ Важно:</b> {critical_match['warning']}\n"
+        # Вставляем предупреждение после резюме
+        answer = re.sub(
+            r"(<b>1\. Резюме:</b>[\s\S]*?)(?=<b>|$)",
+            lambda m: m.group(1) + warning,
+            answer,
+        )
+        # Только релевантные пункты
+        related_punkts = []
+        if main_punkt and main_punkt["punkt_num"] not in cited_nums:
+            related_punkts.append(main_punkt)
+        for p in fallback_punkts:
+            if p and p["punkt_num"] not in cited_nums:
+                related_punkts.append(p)
+        if related_punkts:
+            related_text = "\n".join(
+                f"– п. {p['punkt_num']}" +
+                (f" подп. {p['subpunkt_num']}" if p.get('subpunkt_num') else "") +
+                " — " +
+                (p['text'].strip().split('\n')[0][:130] + "..." if len(p['text']) > 130 else p['text'].strip())
+                for p in related_punkts
+            )
+        else:
+            related_text = "Нет дополнительных связанных пунктов."
+        answer = re.sub(
+            r"<b>6\. Связанные пункты:</b>\n[\s\S]*?(?=<b>|$)",
+            f"<b>6. Связанные пункты:</b>\n{related_text}\n",
+            answer,
+        )
+        # ----------- сортировка и проверка остальных разделов ----------
+        def sort_docs(m):
+            docs = m.group(1).strip().splitlines()
+            docs = sorted(set(docs), key=lambda x: re.sub(r'\D', '', x))
+            return "<b>3. Документы, которые заполняются:</b>\n" + "\n".join(docs) + "\n"
+        answer = re.sub(
+            r"<b>3\. Документы, которые заполняются:</b>\n([\s\S]*?)(?=<b>|$)",
+            sort_docs,
+            answer,
+        )
+        bad_phrases = [
+            "по закону", "по документу", "по правилам",
+            "обычно", "можно", "как правило", "чаще всего",
+            "означает", "в случае", "если"
+        ]
+        for phrase in bad_phrases:
+            if phrase in answer.lower():
+                logger.warning(f"❗ Найдена недопустимая фраза в ответе: {phrase}")
+        return answer.strip()
+
+    # ---------- 4. Автоматический режим для всех остальных ----------
     related_punkts = get_related_punkts_universal(
         q, punkts, PUNKTS, PUNKT_EMBS, top_k=5, min_sim=0.5
     )
@@ -570,24 +673,20 @@ def postprocess_answer(q, punkts, answer):
     else:
         related_text = "Нет дополнительных связанных пунктов."
 
-    # Вставить/заменить раздел:
     answer = re.sub(
         r"<b>6\. Связанные пункты:</b>\n[\s\S]*?(?=<b>|$)",
         f"<b>6. Связанные пункты:</b>\n{related_text}\n",
         answer,
     )
-
     def sort_docs(m):
         docs = m.group(1).strip().splitlines()
-        docs = sorted(set(docs), key=lambda x: re.sub(r'\D', '', x))  # сортируем по номеру, грубо
+        docs = sorted(set(docs), key=lambda x: re.sub(r'\D', '', x))
         return "<b>3. Документы, которые заполняются:</b>\n" + "\n".join(docs) + "\n"
-
     answer = re.sub(
         r"<b>3\. Документы, которые заполняются:</b>\n([\s\S]*?)(?=<b>|$)",
         sort_docs,
         answer,
     )
-    # postprocess_answer — после генерации ответа:
     bad_phrases = [
         "по закону", "по документу", "по правилам",
         "обычно", "можно", "как правило", "чаще всего",
@@ -596,9 +695,7 @@ def postprocess_answer(q, punkts, answer):
     for phrase in bad_phrases:
         if phrase in answer.lower():
             logger.warning(f"❗ Найдена недопустимая фраза в ответе: {phrase}")
-            # Можно вызывать дополнительную коррекцию, если требуется
-
-    return answer.strip()    
+    return answer.strip()
 
 def check_completeness(q, punkts, answer):
     cited_nums = set(re.findall(r"п\. ?(\d+)", answer))
