@@ -48,6 +48,44 @@ except ModuleNotFoundError:
 import openai
 from bs4 import BeautifulSoup
 import numpy as np
+def get_related_punkts_universal(q, main_punkts, all_punkts, punkt_embs, top_k=5, min_sim=0.5):
+    """
+    Возвращает список связанных пунктов на основе семантической близости к вопросу,
+    исключая уже процитированные пункты.
+    """
+    import numpy as np
+    import openai
+
+    emb = openai.embeddings.create(
+        model="text-embedding-ada-002",
+        input=q
+    ).data[0].embedding
+    qv = np.asarray(emb, dtype=np.float32)
+
+    used_keys = {(p['punkt_num'], p.get('subpunkt_num', '')) for p in main_punkts}
+
+    related = []
+    for i, p in enumerate(all_punkts):
+        key = (p["punkt_num"], p.get("subpunkt_num", ""))
+        if key in used_keys:
+            continue
+        emb = punkt_embs[i]
+        sim = np.dot(qv, emb) / (np.linalg.norm(qv) * np.linalg.norm(emb) + 1e-8)
+        related.append((sim, p))
+
+    related = [p for sim, p in sorted(related, key=lambda x: -x[0]) if sim > min_sim]
+    unique_keys = set()
+    out = []
+    for p in related:
+        key = (p["punkt_num"], p.get("subpunkt_num", ""))
+        if key not in unique_keys:
+            out.append(p)
+            unique_keys.add(key)
+        if len(out) >= top_k:
+            break
+
+    return out
+
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     ContextTypes, filters,
@@ -518,20 +556,24 @@ def postprocess_answer(q, punkts, answer):
     ]:
         if f"<b>{sec}:</b>" not in answer:
             answer += f"\n\n<b>{sec}:</b>\nНет информации по данному разделу."
+    related_punkts = get_related_punkts_universal(
+        q, punkts, PUNKTS, PUNKT_EMBS, top_k=5, min_sim=0.5
+    )
+    if related_punkts:
+        related_text = "\n".join(
+            f"– п. {p['punkt_num']}" +
+            (f" подп. {p['subpunkt_num']}" if p.get('subpunkt_num') else "") +
+            " — " +
+            (p['text'].strip().split('\n')[0][:130] + "..." if len(p['text']) > 130 else p['text'].strip())
+            for p in related_punkts
+        )
+    else:
+        related_text = "Нет дополнительных связанных пунктов."
 
-    def clean_linked_punkts(m):
-        lines = m.group(1).splitlines()
-        filtered = []
-        for line in lines:
-            match = re.search(r"п\. ?(\d+[\w\.]*)", line)
-            if match and match.group(1) in cited_nums:
-                continue
-            filtered.append(line)
-        return "<b>6. Связанные пункты:</b>\n" + "\n".join(filtered) + "\n"
-
+    # Вставить/заменить раздел:
     answer = re.sub(
-        r"<b>6\. Связанные пункты:</b>\n([\s\S]*?)(?=<b>|$)",
-        clean_linked_punkts,
+        r"<b>6\. Связанные пункты:</b>\n[\s\S]*?(?=<b>|$)",
+        f"<b>6. Связанные пункты:</b>\n{related_text}\n",
         answer,
     )
 
@@ -732,5 +774,3 @@ async def main():
 if __name__ == "__main__":
     import asyncio
     asyncio.run(main())
-
-
