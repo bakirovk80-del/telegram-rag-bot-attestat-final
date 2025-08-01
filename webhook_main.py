@@ -50,8 +50,10 @@ from bs4 import BeautifulSoup
 import numpy as np
 def get_related_punkts_universal(q, main_punkts, all_punkts, punkt_embs, top_k=5, min_sim=0.5):
     """
-    Возвращает список связанных пунктов на основе семантической близости к вопросу,
-    исключая уже процитированные пункты.
+    Возвращает ТОЛЬКО максимально релевантные связанные пункты:
+    — Они не процитированы в основном ответе;
+    — В их тексте встречается хотя бы одно ключевое слово из запроса;
+    — Имеют высокую семантическую близость.
     """
     import numpy as np
     import openai
@@ -63,6 +65,7 @@ def get_related_punkts_universal(q, main_punkts, all_punkts, punkt_embs, top_k=5
     qv = np.asarray(emb, dtype=np.float32)
 
     used_keys = {(p['punkt_num'], p.get('subpunkt_num', '')) for p in main_punkts}
+    keywords = set(re.findall(r'\w+', q.lower()))
 
     related = []
     for i, p in enumerate(all_punkts):
@@ -71,9 +74,13 @@ def get_related_punkts_universal(q, main_punkts, all_punkts, punkt_embs, top_k=5
             continue
         emb = punkt_embs[i]
         sim = np.dot(qv, emb) / (np.linalg.norm(qv) * np.linalg.norm(emb) + 1e-8)
+        # Фильтрация: только если есть хотя бы одно ключевое слово в тексте
+        if not keywords & set(re.findall(r'\w+', p["text"].lower())):
+            continue
         related.append((sim, p))
 
     related = [p for sim, p in sorted(related, key=lambda x: -x[0]) if sim > min_sim]
+    # Убираем повторные номера
     unique_keys = set()
     out = []
     for p in related:
@@ -85,7 +92,6 @@ def get_related_punkts_universal(q, main_punkts, all_punkts, punkt_embs, top_k=5
             break
 
     return out
-
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     ContextTypes, filters,
