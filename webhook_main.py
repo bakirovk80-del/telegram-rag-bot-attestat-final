@@ -22,6 +22,8 @@ if not os.path.exists("service_account.json"):
         raise RuntimeError("Переменная GOOGLE_CREDENTIALS_JSON не задана!")
 
 import inspect, json, re, time
+with open("related_punkts_map.json", encoding="utf-8") as f:
+    RELATED_MAP = json.load(f)
 from functools import lru_cache
 from itertools import groupby
 import gspread
@@ -85,6 +87,26 @@ def get_related_punkts_universal(q, main_punkts, all_punkts, punkt_embs, top_k=5
             break
 
     return out
+def get_related_punkts_by_map(main_punkts, related_map, all_punkts, top_k=5):
+    """
+    Возвращает список связанных пунктов по карте related_map для списка main_punkts.
+    """
+    found_nums = {p['punkt_num'] for p in main_punkts}
+    related_nums = set()
+    for p in main_punkts:
+        links = related_map.get(p['punkt_num'], [])
+        related_nums.update(links)
+    # Убираем уже процитированные
+    related_nums = related_nums - found_nums
+    # Находим сами пункты по их номерам
+    result = []
+    for pn in related_nums:
+        for p in all_punkts:
+            if p['punkt_num'] == pn and p not in result:
+                result.append(p)
+                if len(result) >= top_k:
+                    return result
+    return result
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     ContextTypes, filters,
@@ -582,9 +604,12 @@ def postprocess_answer(q, punkts, answer):
     ]:
         if f"<b>{sec}:</b>" not in answer:
             answer += f"\n\n<b>{sec}:</b>\nНет информации по данному разделу."
-    related_punkts = get_related_punkts_universal(
-        q, punkts, PUNKTS, PUNKT_EMBS, top_k=5, min_sim=0.5
+    related_punkts = get_related_punkts_by_map(
+    punkts, RELATED_MAP, PUNKTS, top_k=5
     )
+
+# ... формирование related_text ...
+
     if related_punkts:
         related_text = "\n".join(
             f"– п. {p['punkt_num']}" +
