@@ -324,7 +324,6 @@ from functools import lru_cache
 def rag_search(question: str, k: int = 60):
     q_lower = question.lower()
     primary_rows = []
-
     # 1. Магистратура, зарубеж, Болашак, Nazarbayev, PhD
     if re.search(r"(болашак|nazarbayev|назарбаев|phd|доктор наук|зарубеж(ом|ный|ном)|европ|usa|uk|магистр|master|магистратур|докторант|докторантура|поствузовск|международн)", q_lower):
         primary_rows += [p for p in PUNKTS if p["punkt_num"] == "32"]
@@ -353,14 +352,14 @@ def rag_search(question: str, k: int = 60):
     if re.search(r"(протокол|заседан|решение комиссии|лист|выписка|приказ|заключени)", q_lower):
         primary_rows += [p for p in PUNKTS if p["punkt_num"] in {"10","11","12","13","20","26"}]
 
-    # --- Добавляем маппинг по ручной карте UNIVERSAL_MAP
+    # --- Добавляем маппинг по твоей ручной карте UNIVERSAL_MAP
     mapped = []
     for kword, v in UNIVERSAL_MAP.items():
         if kword in q_lower:
             mapped += [p for p in PUNKTS if p["punkt_num"] == v["punkt_num"]
                        and (v["subpunkt_num"] == "" or p["subpunkt_num"] == v["subpunkt_num"])]
 
-    # --- Эмбеддинг-поиск
+    # --- Далее стандартный эмбеддинг и keywords поиск
     try:
         emb = openai.embeddings.create(
             model="text-embedding-ada-002",
@@ -390,7 +389,7 @@ def rag_search(question: str, k: int = 60):
         trigger_nums += ["17", "18", "20"]
     triggers = [p for p in PUNKTS if p["punkt_num"] in trigger_nums]
 
-    # --- Собираем все ряды (приоритетно, чтобы ручные не "давились" семантикой)
+    # --- Собираем все ряды, приоритет: primary > mapped > semant > regexed > triggers > soft_blocks
     rows = []
     seen = set()
     for l in (primary_rows, mapped, semant, regexed, triggers, soft_blocks(question)):
@@ -411,6 +410,7 @@ def rag_search(question: str, k: int = 60):
     rows = unique(rows)
     print("RAG SELECTED:", [(p["punkt_num"], p["text"][:70]) for p in rows[:k]])
     return rows[:k]
+
 
 def build_prompt(q, punkts):
     context = "\n\n".join(
