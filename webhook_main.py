@@ -552,7 +552,7 @@ def postprocess_answer(q, punkts, answer):
     "означает", "в случае", "если"
 ]
     for phrase in bad_phrases:
-    if phrase in answer.lower():
+        if phrase in answer.lower():
         logger.warning(f"❗ Найдена недопустимая фраза в ответе: {phrase}")
         # Можно вызывать дополнительную коррекцию, если требуется
 
