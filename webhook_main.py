@@ -583,7 +583,7 @@ def postprocess_answer(q, punkts, answer):
         if f"<b>{sec}:</b>" not in answer:
             answer += f"\n\n<b>{sec}:</b>\nНет информации по данному разделу."
     related_punkts = get_related_punkts_universal(
-        q, punkts, PUNKTS, PUNKT_EMBS, top_k=4, min_sim=0.6
+        q, punkts, PUNKTS, PUNKT_EMBS, top_k=5, min_sim=0.5
     )
     if related_punkts:
         related_text = "\n".join(
