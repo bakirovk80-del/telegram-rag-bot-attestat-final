@@ -550,7 +550,7 @@ def postprocess_answer(q, punkts, answer):
     "по закону", "по документу", "по правилам",
     "обычно", "можно", "как правило", "чаще всего",
     "означает", "в случае", "если"
-]
+    ]
     for phrase in bad_phrases:
         if phrase in answer.lower():
         logger.warning(f"❗ Найдена недопустимая фраза в ответе: {phrase}")
