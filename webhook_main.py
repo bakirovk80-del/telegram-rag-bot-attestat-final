@@ -48,43 +48,6 @@ except ModuleNotFoundError:
 import openai
 from bs4 import BeautifulSoup
 import numpy as np
-def get_related_punkts_universal(q, main_punkts, all_punkts, punkt_embs, top_k=5, min_sim=0.5):
-    """
-    Возвращает список связанных пунктов на основе семантической близости к вопросу,
-    исключая уже процитированные пункты.
-    """
-    import numpy as np
-    import openai
-
-    emb = openai.embeddings.create(
-        model="text-embedding-ada-002",
-        input=q
-    ).data[0].embedding
-    qv = np.asarray(emb, dtype=np.float32)
-
-    used_keys = {(p['punkt_num'], p.get('subpunkt_num', '')) for p in main_punkts}
-
-    related = []
-    for i, p in enumerate(all_punkts):
-        key = (p["punkt_num"], p.get("subpunkt_num", ""))
-        if key in used_keys:
-            continue
-        emb = punkt_embs[i]
-        sim = np.dot(qv, emb) / (np.linalg.norm(qv) * np.linalg.norm(emb) + 1e-8)
-        related.append((sim, p))
-
-    related = [p for sim, p in sorted(related, key=lambda x: -x[0]) if sim > min_sim]
-    unique_keys = set()
-    out = []
-    for p in related:
-        key = (p["punkt_num"], p.get("subpunkt_num", ""))
-        if key not in unique_keys:
-            out.append(p)
-            unique_keys.add(key)
-        if len(out) >= top_k:
-            break
-
-    return out
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     ContextTypes, filters,
@@ -318,48 +281,16 @@ def add_all_violation_punkts(rows, question):
                     rows.append(p)
     return rows
 
-from functools import lru_cache
-
 @lru_cache(maxsize=256)
 def rag_search(question: str, k: int = 60):
-    q_lower = question.lower()
-    primary_rows = []
-    # 1. Магистратура, зарубеж, Болашак, Nazarbayev, PhD
-    if re.search(r"(болашак|nazarbayev|назарбаев|phd|доктор наук|зарубеж(ом|ный|ном)|европ|usa|uk|магистр|master|магистратур|докторант|докторантура|поствузовск|международн)", q_lower):
-        primary_rows += [p for p in PUNKTS if p["punkt_num"] == "32"]
-    # 2. Пенсия, возраст, освобождение по возрасту
-    if re.search(r"(пенси|пенсион|возраст|старше|по возрасту|пенсионер|лет до пенсии)", q_lower):
-        primary_rows += [p for p in PUNKTS if p["punkt_num"] in {"29", "30"}]
-    # 3. Беременность, декрет, уход за ребенком, болезнь
-    if re.search(r"(беременн|декрет|уход за ребен|болезн|нетрудоспособн|освобожд.*от аттест|отсрочк|отпуск)", q_lower):
-        primary_rows += [p for p in PUNKTS if p["punkt_num"] in {"29", "30"}]
-    # 4. Досрочная/внеочередная аттестация
-    if re.search(r"(досрочн|внеочередн|ускорен|немедленн|срочн|повторн|неотложн|раньше срока)", q_lower):
-        primary_rows += [p for p in PUNKTS if p["punkt_num"] in {"31", "32", "63", "64"}]
-    # 5. Жалоба, апелляция, оспаривание, спор
-    if re.search(r"(жалоб|апелляц|оспор|претенз|обжал|пересмотр|спорн|рассмотрен|несоглас|комисси)", q_lower):
-        primary_rows += [p for p in PUNKTS if p["punkt_num"] in {"17", "18", "20"}]
-    # 6. Нарушения, аннулирование, ответственность, фальсификация
-    if re.search(r"(наруш|акт|аннулир|ответственн|санкц|отказ|отстран|дисквалификац|фальсификац|дисциплинарн|наказан|обнаружен|отклон|недостоверн|лишен|понижен|неправомерн)", q_lower):
-        primary_rows += [p for p in PUNKTS if p["punkt_num"] in {"10","11","12","20","45","46","47","62"}]
-    # 7. Формы, заявления, порталы, egov
-    if re.search(r"(форма|заявлени|портал|egov|электронное правительство|приложен|документ|подача|регистрац|перечень)", q_lower):
-        primary_rows += [p for p in PUNKTS if p["punkt_num"] in {"13","15","16"}]
-    # 8. Первая категория, стажёр, присвоение, опыт работы
-    if re.search(r"(стажер|стажёр|первичн|первый раз|впервые|опыт|категор|присвоен|присвоени|подтвержден|подтверждени|исключени|утвержден)", q_lower):
-        primary_rows += [p for p in PUNKTS if p["punkt_num"] in {"23","24","25","28"}]
-    # 9. Протоколы, заседание, решения комиссии
-    if re.search(r"(протокол|заседан|решение комиссии|лист|выписка|приказ|заключени)", q_lower):
-        primary_rows += [p for p in PUNKTS if p["punkt_num"] in {"10","11","12","13","20","26"}]
-
-    # --- Добавляем маппинг по твоей ручной карте UNIVERSAL_MAP
     mapped = []
+    q_lower = question.lower()
     for kword, v in UNIVERSAL_MAP.items():
         if kword in q_lower:
             mapped += [p for p in PUNKTS if p["punkt_num"] == v["punkt_num"]
                        and (v["subpunkt_num"] == "" or p["subpunkt_num"] == v["subpunkt_num"])]
 
-    # --- Далее стандартный эмбеддинг и keywords поиск
+    # Эмбеддинг-поиск (через OpenAI, если вопрос релевантен)
     try:
         emb = openai.embeddings.create(
             model="text-embedding-ada-002",
@@ -372,37 +303,42 @@ def rag_search(question: str, k: int = 60):
     except Exception:
         semant = []
 
-    # --- keywords (fallback)
+    # Regex/keyword-поиск
     keywords = set(re.findall(r'\w+', q_lower))
     regexed = []
     for word in keywords:
         if len(word) >= 4:
             regexed += [p for p in PUNKTS if word in p["text"].lower()]
-
-    # --- triggers (fallback)
+    # Trigger-based (универсальные важные пункты)
     trigger_nums = []
     if re.search(r"наруш|ответственн|аннулир|акт|фальсификац|недостоверн", q_lower):
         trigger_nums += ["45", "46", "47", "62"]
     if re.search(r"пенси|возраст|пенсион|освобожд|уход за ребен|беременн|декрет", q_lower):
         trigger_nums += ["29", "30"]
+    if re.search(r"болаша|nazarbayev|phd|степень|исследоват|магистр", q_lower):
+        trigger_nums += ["32"]
     if re.search(r"апелляц|жалоб|обжал|спорн|пересмотр|комисси", q_lower):
         trigger_nums += ["17", "18", "20"]
     triggers = [p for p in PUNKTS if p["punkt_num"] in trigger_nums]
 
-    # --- Собираем все ряды, приоритет: primary > mapped > semant > regexed > triggers > soft_blocks
+    # Собираем всё в rows
     rows = []
     seen = set()
-    for l in (primary_rows, mapped, semant, regexed, triggers, soft_blocks(question)):
+    for l in (mapped, semant, regexed, triggers):
         for p in l:
-            key = (p["punkt_num"], p.get("subpunkt_num", ""))
+            key = (p["punkt_num"], p["subpunkt_num"])
             if key not in seen:
                 rows.append(p)
                 seen.add(key)
 
+    # --- ДОБАВЛЯЕМ soft_blocks для максимального покрытия ---
+    rows += soft_blocks(question)
+
+    # Fallback если всё пусто
     if not rows:
         rows = bm25_fallback(question, 10)
 
-    # --- постпроцессинг ---
+    # Оставляем ваши постпроцессоры!
     rows = unique(rows)
     rows = merge_bullets(rows)
     rows = _drop_headers(rows)
@@ -582,24 +518,20 @@ def postprocess_answer(q, punkts, answer):
     ]:
         if f"<b>{sec}:</b>" not in answer:
             answer += f"\n\n<b>{sec}:</b>\nНет информации по данному разделу."
-    related_punkts = get_related_punkts_universal(
-        q, punkts, PUNKTS, PUNKT_EMBS, top_k=5, min_sim=0.5
-    )
-    if related_punkts:
-        related_text = "\n".join(
-            f"– п. {p['punkt_num']}" +
-            (f" подп. {p['subpunkt_num']}" if p.get('subpunkt_num') else "") +
-            " — " +
-            (p['text'].strip().split('\n')[0][:130] + "..." if len(p['text']) > 130 else p['text'].strip())
-            for p in related_punkts
-        )
-    else:
-        related_text = "Нет дополнительных связанных пунктов."
 
-    # Вставить/заменить раздел:
+    def clean_linked_punkts(m):
+        lines = m.group(1).splitlines()
+        filtered = []
+        for line in lines:
+            match = re.search(r"п\. ?(\d+[\w\.]*)", line)
+            if match and match.group(1) in cited_nums:
+                continue
+            filtered.append(line)
+        return "<b>6. Связанные пункты:</b>\n" + "\n".join(filtered) + "\n"
+
     answer = re.sub(
-        r"<b>6\. Связанные пункты:</b>\n[\s\S]*?(?=<b>|$)",
-        f"<b>6. Связанные пункты:</b>\n{related_text}\n",
+        r"<b>6\. Связанные пункты:</b>\n([\s\S]*?)(?=<b>|$)",
+        clean_linked_punkts,
         answer,
     )
 
