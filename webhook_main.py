@@ -286,6 +286,9 @@ def add_all_violation_punkts(rows, question):
 def rag_search(question: str, k: int = 60):
     mapped = []
     q_lower = question.lower()
+    primary_rows = []
+    if re.search(r"(болашак|nazarbayev|назарбаев|phd|доктор наук|зарубеж(ом|ный|ном)|европ|usa|uk|магистр|master|магистратур|докторант|докторантура|поствузовск|международн)", q_lower):
+        primary_rows += [p for p in PUNKTS if p["punkt_num"] == "32"]
     for kword, v in UNIVERSAL_MAP.items():
         if kword in q_lower:
             mapped += [p for p in PUNKTS if p["punkt_num"] == v["punkt_num"]
@@ -325,12 +328,13 @@ def rag_search(question: str, k: int = 60):
     # Собираем всё в rows
     rows = []
     seen = set()
-    for l in (mapped, semant, regexed, triggers):
+    for l in (primary_rows, mapped, semant, regexed, triggers):
         for p in l:
             key = (p["punkt_num"], p["subpunkt_num"])
             if key not in seen:
                 rows.append(p)
                 seen.add(key)
+
 
     # --- ДОБАВЛЯЕМ soft_blocks для максимального покрытия ---
     rows += soft_blocks(question)
