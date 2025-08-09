@@ -305,56 +305,51 @@ def rag_search(q: str, top_k_stage1: int = 120, final_k: int = 45) -> List[Dict[
     dense_agg: Dict[int, float] = {}
     sparse_agg: Dict[int, float] = {}
 
-    # Dense for each variant
+    # Dense для каждого варианта
     for v in variants:
         for idx, sc in vector_search(v, top_k=top_k_stage1):
             dense_agg[idx] = max(dense_agg.get(idx, 0.0), sc)
 
-    # Sparse for base + variants
+    # Sparse для базового и вариантов
     for v in [q] + variants:
         for idx, sc in bm25_search(v, top_k=top_k_stage1):
             sparse_agg[idx] = max(sparse_agg.get(idx, 0.0), sc)
 
-    # Regex & mapped
+    # Явные попадания
     regex_idx = regex_hits(q)
     mapped_idx = mapped_hits(q)
 
-    # Нормируем sparse (z-score) для сопоставимости
+    # Нормируем sparse (z-score)
     if sparse_agg:
         vals = np.array(list(sparse_agg.values()), dtype=np.float64)
         mu, sigma = float(vals.mean()), float(vals.std() + 1e-6)
         for k in list(sparse_agg.keys()):
             sparse_agg[k] = (sparse_agg[k] - mu) / sigma
 
-    # Merge
+    # Аггрегируем очки
     items: List[Tuple[int, float]] = []
-    for idx in set(list(dense_agg.keys()) + list(sparse_agg.keys()) + regex_idx + mapped_idx):
+    candidate_ids = set(list(dense_agg.keys()) + list(sparse_agg.keys()) + regex_idx + mapped_idx)
+    for idx in candidate_ids:
         emb_sc = dense_agg.get(idx, 0.0)
-        sp_sc = sparse_agg.get(idx, 0.0)
-        rx_sc = 1.0 if idx in regex_idx else 0.0
-        mp_sc = 1.0 if idx in mapped_idx else 0.0
-        total = W_EMB * emb_sc + W_BM25 * sp_sc + W_REGEX * rx_sc + W_MAP * mp_sc
+        sp_sc  = sparse_agg.get(idx, 0.0)
+        rx_sc  = 1.0 if idx in regex_idx  else 0.0
+        mp_sc  = 1.0 if idx in mapped_idx else 0.0
+        total  = W_EMB*emb_sc + W_BM25*sp_sc + W_REGEX*rx_sc + W_MAP*mp_sc
         items.append((idx, total))
 
-    # Сортируем и берём topN
+    # Сортировка и выбор top-K
     items.sort(key=lambda x: -x[1])
     top_idx = [i for i, _ in items[:final_k]]
-    selected = [PUNKTS[i] for i in top_idx]
 
-    # Лог в отладку
+    # Форс-включаем явные совпадения из mapped/regex
+    for i in mapped_idx + regex_idx:
+        if i not in top_idx:
+            top_idx.append(i)
+    top_idx = top_idx[:final_k]
+
+    selected = [PUNKTS[i] for i in top_idx]
     logger.debug("RAG selected idx: %s", top_idx[:15])
     return selected
-
-items.sort(key=lambda x: -x[1])
-top_idx = [i for i, _ in items[:final_k]]
-
-# ⬇️ форс-включаем явные попадания из mapped/regex
-for i in mapped_idx + regex_idx:
-    if i not in top_idx:
-        top_idx.append(i)
-top_idx = top_idx[:final_k]
-
-selected = [PUNKTS[i] for i in top_idx]
 
 # ───────────────────── Генерация ответа (LLM) ───────────────────
 
