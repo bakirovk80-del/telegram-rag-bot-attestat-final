@@ -538,8 +538,10 @@ def tg_send_message(chat_id: int, text: str, parse_mode: str = "HTML", reply_mar
         "text": text,
         "parse_mode": parse_mode,
         "disable_web_page_preview": True,
-        "reply_markup": reply_markup,
     }
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup  # добавляем только если объект
+
     r = requests.post(url, json=payload, timeout=15)
     if not r.ok:
         logger.error("sendMessage failed: %s %s", r.status_code, r.text)
@@ -549,6 +551,7 @@ def tg_send_message(chat_id: int, text: str, parse_mode: str = "HTML", reply_mar
     except Exception:
         return None
 
+
 def tg_edit_message_text(chat_id: int, message_id: int, text: str, parse_mode: str = "HTML", reply_markup: Optional[dict] = None) -> None:
     url = f"{TELEGRAM_API}/editMessageText"
     payload = {
@@ -557,11 +560,14 @@ def tg_edit_message_text(chat_id: int, message_id: int, text: str, parse_mode: s
         "text": text,
         "parse_mode": parse_mode,
         "disable_web_page_preview": True,
-        "reply_markup": reply_markup,
     }
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup  # добавляем только если объект
+
     r = requests.post(url, json=payload, timeout=15)
     if not r.ok:
         logger.error("editMessageText failed: %s %s", r.status_code, r.text)
+
 def kb_show_detailed():
     return {"inline_keyboard": [[{"text": "Показать подробный ответ", "callback_data": "show_detailed"}]]}
 
