@@ -124,7 +124,7 @@ W_MAP = 1.25
 W_REGEX = 0.15
 
 # рядом с другими весами
-W_CAT = 1.1
+W_CAT = 1.6
 CAT_KEYS = ("исследовател", "модератор", "эксперт", "мастер")
 
 
@@ -160,16 +160,25 @@ def kw_boost(question: str, doc_text: str) -> float:
     dl = (doc_text or "").lower().replace("ё", "е")
 
     boost = 0.0
+    is_category_q = any(k in ql for k in CAT_KEYS)
+
     foreign_q = any(k in ql for k in ("магист", "за рубеж", "за границ", "зарубеж", "иностран"))
-    if foreign_q:
+    if foreign_q and not is_category_q:
         if any(k in dl for k in KW_EXCEPTION_TERMS):
             boost += 0.6
         if any(k in dl for k in KW_FOREIGN_TERMS):
             boost += 0.6
-    # общий случай: если в документе есть явное "без прохождения" — подбустим всегда
-    if any(k in dl for k in KW_EXCEPTION_TERMS):
+
+    # общий случай: «без прохождения...» слегка подбустим,
+    # НО если вопрос про категорию — наоборот, чуть прижмём такие пункты
+    has_exception_phrase = any(k in dl for k in KW_EXCEPTION_TERMS)
+    if has_exception_phrase:
         boost += 0.3
+        if is_category_q:
+            boost -= 0.6  # штраф для льгот, когда спрашивают про категорию
+
     return boost
+
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
@@ -760,13 +769,23 @@ def enforce_short_answer(question: str, data: dict, ctx_text: str) -> dict:
     cites = {str(c.get("punkt_num","")) for c in (data.get("citations") or [])}
     ctx = (ctx_text or "").lower()
 
+    is_category_q = any(k in (question or "").lower() for k in ("исследовател", "модератор", "эксперт", "мастер"))
     has_exception_signals = any(k in ctx for k in KW_EXCEPTION_TERMS)
+
     starts_yes_no = bool(re.fullmatch(r"\s*(да|нет)[\.\!]*\s*", sa, flags=re.I))
     has_bad_proof = ("3" in cites) or ("41" in cites)
     uses_obligation = re.search(r"\b(обязан|обязательно|должен|необходимо)\b", sa.lower())
 
-    if has_exception_signals and not sa.lower().startswith("зависит:"):
-        sa = "Зависит: " + sa
+    # «Зависит:» ставим ТОЛЬКО если вопрос про иностранное/льготы
+    foreign_trigger = any(t in (question or "").lower() for t in ("магист", "за рубеж", "зарубеж", "иностран", "болаш"))
+    if has_exception_signals and foreign_trigger:
+        if not sa.lower().startswith("зависит:"):
+            sa = "Зависит: " + sa
+    else:
+        # для категорий без явных условий — принудительно «По общим правилам:»
+        if is_category_q and not sa.lower().startswith(("по общим правилам:", "зависит:")):
+            sa = "По общим правилам: " + sa
+
     if starts_yes_no:
         sa = "По общим правилам: " + sa.capitalize()
     if has_bad_proof and uses_obligation:
@@ -774,6 +793,7 @@ def enforce_short_answer(question: str, data: dict, ctx_text: str) -> dict:
 
     data["short_answer"] = sa[:200]
     return data
+
 
 
 # ───────────────────── Пост-процесс и рендер ────────────────────
@@ -832,7 +852,37 @@ def validate_citations(citations: List[Dict[str, Any]], punkts: List[Dict[str, A
             uniq.append(c)
 
     return uniq[:8]
+# ── Фильтрация цитат по ключевым словам из вопроса ──
+def filter_citations_by_question(question: str,
+                                 citations: List[Dict[str, Any]],
+                                 punkts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    ql = (question or "").lower().replace("ё", "е")
 
+    # Ключи из вопроса: иностранное/Болашақ и конкретные категории
+    keys: List[str] = []
+    if any(k in ql for k in ("магист", "зарубеж", "за границ", "иностран", "болаш", "bolash", "nazarbayev university")):
+        keys.extend(["зарубеж", "болаш", "nazarbayev university", "без прохождения"])
+    for k in ("исследовател", "модератор", "эксперт", "мастер"):
+        if k in ql:
+            keys.append(k)
+
+    if not keys:
+        return citations  # ничего не фильтруем, если ключей нет
+
+    by_key = {
+        (str(p.get("punkt_num","")), str(p.get("subpunkt_num",""))): (p.get("text") or "").lower().replace("ё", "е")
+        for p in punkts
+    }
+
+    out: List[Dict[str, Any]] = []
+    for c in citations or []:
+        k = (str(c.get("punkt_num","")), str(c.get("subpunkt_num","")))
+        txt = by_key.get(k, "")
+        if any(key in txt for key in keys):
+            out.append(c)
+
+    # если всё выкинули — вернём исходные, чтобы не было пусто
+    return out or citations
 
 
 def split_for_telegram(text: str, limit: int = 4000) -> List[str]:
@@ -910,6 +960,7 @@ def render_detailed_html(question: str, data: Dict[str, Any], punkts: List[Dict[
     sa = html.escape(data.get("short_answer", "")).strip()
     ra = html.escape(data.get("reasoned_answer", "")).strip()
     citations = validate_citations(data.get("citations", []), punkts)
+    citations = filter_citations_by_question(question, citations, punkts)
     related = data.get("related", [])
     lines: List[str] = []
     lines.append(f"<b>Вопрос:</b> {html.escape(question)}")
