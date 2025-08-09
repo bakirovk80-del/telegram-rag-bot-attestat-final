@@ -135,8 +135,9 @@ KW_FOREIGN_TERMS = (
     "иностран", "nazarbayev university", "болаш",
 )
 def kw_boost(question: str, doc_text: str) -> float:
-    ql = (question or "").lower()
-    dl = (doc_text or "").lower()
+    ql = (question or "").lower().replace("ё", "е")
+    dl = (doc_text or "").lower().replace("ё", "е")
+
     boost = 0.0
     foreign_q = any(k in ql for k in ("магист", "за рубеж", "за границ", "зарубеж", "иностран"))
     if foreign_q:
@@ -485,55 +486,51 @@ def ask_llm(question: str, punkts: List[Dict[str, Any]]) -> Dict[str, Any]:
         temperature=0.2,
         response_format={"type": "json_object"},
     )
-    def _needs_reask(question: str, data: Dict[str, Any]) -> bool:
-        ql = (question or "").lower()
-        if any(k in ql for k in ("магист", "за рубеж", "за границ", "зарубеж", "иностран")):
-            cited = {str(c.get("punkt_num","")) for c in data.get("citations", [])}
-        # если в цитатах нет ни 5, ни 32 — велика вероятность, что проигнорирована спец-норма
-            if not (("5" in cited) or ("32" in cited)):
-             return ("5" not in cited) and ("32" not in cited)
-    return False
 
-    text = resp.choices[0].message.content.strip()
+    raw = (resp.choices[0].message.content or "").strip()
     try:
-        data = json.loads(text)
-        # Валидация базовой схемы
+        data = json.loads(raw)
         assert isinstance(data.get("short_answer", ""), str)
         assert isinstance(data.get("reasoned_answer", ""), str)
         assert isinstance(data.get("citations", []), list)
         assert isinstance(data.get("related", []), list)
     except Exception as e:
-        logger.warning("LLM JSON parse error: %s; raw: %s", e, text[:500])
-        # Фоллбек — минимальный ответ
+        logger.warning("LLM JSON parse error: %s; raw: %s", e, raw[:500])
         data = {
             "short_answer": "Не удалось корректно сформировать структурированный ответ.",
             "reasoned_answer": "Попробуйте сформулировать вопрос иначе или уточните контекст.",
             "citations": [],
             "related": [],
         }
-    # Перезапрос с ужесточением, если для "зарубеж/магистратура" не процитированы спец-нормы
-    try:
-        if _needs_reask(question, data):
-            extra = "\nВАЖНО: Пересобери ответ. Для вопросов про зарубежную магистратуру процитируй спец-нормы (п.5 и/или п.32) из переданного контекста, если они присутствуют; не опирайся на п.3/п.41 как на доказательство обязанности."
-            strict_prompt = GEN_PROMPT_TEMPLATE + extra
-            resp2 = call_with_retries(
-                client.chat.completions.create,
-                model=CHAT_MODEL,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": strict_prompt.format(question=question, context=context_text)},
-                ],
-                temperature=0.1,
-                response_format={"type": "json_object"},
-            )
-            data2 = json.loads(resp2.choices[0].message.content.strip())
-            if isinstance(data2.get("citations", []), list) and data2.get("citations"):
-                data = data2
-    except Exception:
-        pass
 
+    # Повторный, более строгий прогон — только если нужно
+    if _needs_reask(question, data):
+        extra = (
+            "\nВАЖНО: Пересобери ответ. Для вопросов про зарубежную магистратуру "
+            "процитируй спец-нормы (п.5 и/или п.32) из переданного контекста, если они присутствуют; "
+            "не опирайся на п.3/п.41 как на доказательство обязанности."
+        )
+        strict_prompt = GEN_PROMPT_TEMPLATE + extra
+        resp2 = call_with_retries(
+            client.chat.completions.create,
+            model=CHAT_MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": strict_prompt.format(question=question, context=context_text)},
+            ],
+            temperature=0.1,
+            response_format={"type": "json_object"},
+        )
+        raw2 = (resp2.choices[0].message.content or "").strip()
+        try:
+            data2 = json.loads(raw2)
+            if isinstance(data2, dict) and data2.get("citations"):
+                data = data2
+        except Exception as e2:
+            logger.warning("LLM second-pass JSON parse error: %s; raw: %s", e2, raw2[:500])
 
     return data
+
 
 # ───────────────────── Пост-процесс и рендер ────────────────────
 
