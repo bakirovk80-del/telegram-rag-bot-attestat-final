@@ -123,6 +123,18 @@ W_BM25 = 0.75
 W_MAP = 1.25
 W_REGEX = 0.15
 
+# рядом с другими весами
+W_CAT = 1.1
+CAT_KEYS = ("исследовател", "модератор", "эксперт", "мастер")
+
+def kw_category_boost(question: str, doc_text: str) -> float:
+    ql = (question or "").lower().replace("ё", "е")
+    dl = (doc_text or "").lower().replace("ё", "е")
+    for k in CAT_KEYS:
+        if k in ql and f"педагог-{k}" in dl:
+            return 1.0
+    return 0.0
+
 W_KW = 0.9  # вес сигнала по ключевым словам для тематических исключений/зарубеж
 KW_EXCEPTION_TERMS = (
     "без прохождения процедуры аттестации",
@@ -409,6 +421,7 @@ def rag_search(q: str, top_k_stage1: int = 120, final_k: int = 45) -> List[Dict[
         mp_sc  = 1.0 if idx in mapped_idx else 0.0
         total  = W_EMB*emb_sc + W_BM25*sp_sc + W_REGEX*rx_sc + W_MAP*mp_sc
         total += W_KW * kw_boost(q, PUNKTS[idx].get("text",""))
+        total += W_CAT * kw_category_boost(q, PUNKTS[idx].get("text", ""))
         items.append((idx, total))
        
 
@@ -453,6 +466,11 @@ GEN_PROMPT_TEMPLATE = """\
 4) Запрещено использовать п.3 (периодичность) и п.41 (оплата/кол-во попыток) как доказательство обязанности проходить аттестацию. Эти пункты можно указывать только как справочную информацию.
 5) Если вопрос связан с иностранной магистратурой/зарубежным образованием, обязательно проверь и процитируй специальные нормы (например, о присвоении категории без прохождения процедуры, NU/перечень \"Болашақ\") при наличии в контексте.
 6) Не добавляй лишних полей. JSON — без комментариев.
+7) Если вопрос о конкретной категории (модератор/эксперт/исследователь/мастер), 
+   обязательно перечисли этапы (подача, документы/портфолио, критерии/баллы, сроки, решение комиссии) 
+   и процитируй пункты, где категория названа явно. 
+   Не опирайся только на п.2 и п.6 — это недостаточно для вывода.
+
 """
 
 def build_context_snippets(punkts: List[Dict[str, Any]], max_chars: int = 12000) -> str:
@@ -478,11 +496,44 @@ def _needs_reask(question: str, data: Dict[str, Any]) -> bool:
     cited = {str(c.get("punkt_num", "")) for c in data.get("citations", [])}
     # если не процитированы спец-нормы — просим пересобрать
     return ("5" not in cited) and ("32" not in cited)
+def _needs_reask_foreign(question: str, data: Dict[str, Any]) -> bool:
+    """Требовать пересборку, если вопрос про зарубеж/магистратуру,
+    а в цитатах нет спец-норм (здесь примеры: п.5/п.32 — подставь свои реальные номера при необходимости)."""
+    ql = (question or "").lower().replace("ё", "е")
+    if any(k in ql for k in ("магист", "за рубеж", "за границ", "зарубеж", "иностран")):
+        cited = {str(c.get("punkt_num", "")).strip() for c in data.get("citations", [])}
+        return ("5" not in cited) and ("32" not in cited)
+    return False
+
+
+def _needs_reask_category(question: str, data: Dict[str, Any]) -> bool:
+    """Требовать пересборку, если спрашивают про конкретную категорию,
+    а в цитатах нет явных упоминаний самой категории."""
+    ql = (question or "").lower().replace("ё", "е")
+    if any(k in ql for k in ("исследовател", "модератор", "эксперт", "мастер")):
+        # хотя бы одна цитата должна содержать упоминание категории (простая эвристика)
+        for c in data.get("citations", []):
+            qt = (c.get("quote", "") or "").lower()
+            if any(("педагог-" + k) in qt for k in ("исследовател", "модератор", "эксперт", "мастер")):
+                return False
+        return True
+    return False
+
+
+def _too_generic_citations(data: Dict[str, Any]) -> bool:
+    """Ответ опирается только на общие нормы (например, п.2/п.6) — это слабое доказательство."""
+    cited_nums = {str(c.get("punkt_num", "")).strip() for c in data.get("citations", [])}
+    # подстрой под свои реальные «общие» пункты при необходимости
+    return cited_nums != set() and cited_nums.issubset({"2", "6"})
+
 
 def ask_llm(question: str, punkts: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Строим строгий JSON-ответ на основе фрагментов Правил.
+    При необходимости — пересборка с ужесточающим уточнением запроса."""
     context_text = build_context_snippets(punkts)
     user_prompt = GEN_PROMPT_TEMPLATE.format(question=question, context=context_text)
 
+    # 1) первичный запрос
     resp = call_with_retries(
         client.chat.completions.create,
         model=CHAT_MODEL,
@@ -493,31 +544,40 @@ def ask_llm(question: str, punkts: List[Dict[str, Any]]) -> Dict[str, Any]:
         temperature=0.2,
         response_format={"type": "json_object"},
     )
+    text = (resp.choices[0].message.content or "").strip()
 
-    raw = (resp.choices[0].message.content or "").strip()
+    # 2) парсим и валидируем JSON
     try:
-        data = json.loads(raw)
+        data = json.loads(text)
         assert isinstance(data.get("short_answer", ""), str)
         assert isinstance(data.get("reasoned_answer", ""), str)
         assert isinstance(data.get("citations", []), list)
         assert isinstance(data.get("related", []), list)
     except Exception as e:
-        logger.warning("LLM JSON parse error: %s; raw: %s", e, raw[:500])
-        data = {
+        logger.warning("LLM JSON parse error: %s; raw: %s", e, text[:500])
+        return {
             "short_answer": "Не удалось корректно сформировать структурированный ответ.",
             "reasoned_answer": "Попробуйте сформулировать вопрос иначе или уточните контекст.",
             "citations": [],
             "related": [],
         }
 
-    # Повторный, более строгий прогон — только если нужно
-    if _needs_reask(question, data):
+    # 3) эвристики качества цитирования/логики — при необходимости просим пересобрать
+    need_reask = (
+        _needs_reask_foreign(question, data)
+        or _needs_reask_category(question, data)
+        or _too_generic_citations(data)
+    )
+
+    if need_reask:
         extra = (
-            "\nВАЖНО: Пересобери ответ. Для вопросов про зарубежную магистратуру "
-            "процитируй спец-нормы (п.5 и/или п.32) из переданного контекста, если они присутствуют; "
-            "не опирайся на п.3/п.41 как на доказательство обязанности."
+            "\nВАЖНО: Пересобери ответ. Для «зарубеж/магистратура» процитируй спец-нормы (например, п.5 и/или п.32) из переданного контекста, "
+            "если они присутствуют; не опирайся на п.3/п.41 как на доказательство обязанности проходить аттестацию. "
+            "Если вопрос про конкретную категорию (модератор/эксперт/исследователь/мастер) — процитируй пункты, где эта категория названа явно, "
+            "и перечисли этапы (подача, документы/портфолио, критерии/баллы, сроки, решение комиссии)."
         )
         strict_prompt = GEN_PROMPT_TEMPLATE + extra
+
         resp2 = call_with_retries(
             client.chat.completions.create,
             model=CHAT_MODEL,
@@ -528,16 +588,15 @@ def ask_llm(question: str, punkts: List[Dict[str, Any]]) -> Dict[str, Any]:
             temperature=0.1,
             response_format={"type": "json_object"},
         )
-        raw2 = (resp2.choices[0].message.content or "").strip()
+        t2 = (resp2.choices[0].message.content or "").strip()
         try:
-            data2 = json.loads(raw2)
-            if isinstance(data2, dict) and data2.get("citations"):
+            data2 = json.loads(t2)
+            if isinstance(data2.get("citations", []), list) and data2.get("citations"):
                 data = data2
-        except Exception as e2:
-            logger.warning("LLM second-pass JSON parse error: %s; raw: %s", e2, raw2[:500])
+        except Exception:
+            pass
 
     return data
-
 
 # ───────────────────── Пост-процесс и рендер ────────────────────
 
