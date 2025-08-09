@@ -595,8 +595,18 @@ async def on_startup(app: web.Application):
 
 def main():
     app = web.Application()
+
+    # роуты
     app.router.add_get("/health", handle_health)
     app.router.add_post(os.environ.get("WEBHOOK_PATH", "/webhook"), handle_webhook)
+
+    # ⬇️ ВОТ ЗДЕСЬ — «после роутов»
+    app.on_startup.append(on_startup)
+
+    # (необязательно) чтобы / не давал 404:
+    # async def handle_root(request):
+    #     return web.Response(text="ok")
+    # app.router.add_get("/", handle_root)
 
     loop = asyncio.get_event_loop()
     runner = web.AppRunner(app)
@@ -609,6 +619,7 @@ def main():
         pass
     finally:
         loop.run_until_complete(runner.cleanup())
+
 
 if __name__ == "__main__":
     main()
