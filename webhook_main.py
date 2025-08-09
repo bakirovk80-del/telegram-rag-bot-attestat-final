@@ -471,6 +471,13 @@ def build_context_snippets(punkts: List[Dict[str, Any]], max_chars: int = 12000)
         parts.append(one)
         total += len(one) + 2
     return "\n\n".join(parts)
+def _needs_reask(question: str, data: Dict[str, Any]) -> bool:
+    ql = (question or "").lower().replace("ё", "е")
+    if not any(k in ql for k in ("магист", "за рубеж", "за границ", "зарубеж", "иностран")):
+        return False
+    cited = {str(c.get("punkt_num", "")) for c in data.get("citations", [])}
+    # если не процитированы спец-нормы — просим пересобрать
+    return ("5" not in cited) and ("32" not in cited)
 
 def ask_llm(question: str, punkts: List[Dict[str, Any]]) -> Dict[str, Any]:
     context_text = build_context_snippets(punkts)
