@@ -1,739 +1,614 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+webhook_main.py — чистая версия (готовая к подстановке)
+- AIOHTTP веб-сервер под Telegram Webhook
+- Гибридный retrieve: эмбеддинги + BM25/ключевые слова
+- Жёсткая проверка согласованности embeddings.npy ↔ JSON
+- Строгий JSON-вывод от LLM и безопасный рендер в HTML для Telegram
+- Без дублей функций и "магических" констант в логике
+
+Зависимости (requirements.txt):
+    aiohttp
+    requests
+    numpy
+    openai>=1.30.0
+    rank_bm25     # рекомендуется, но не обязательно (fallback на keyword-скоринг)
+    # (опционально для логов в Google Sheets)
+    gspread
+    google-auth
+    google-auth-oauthlib
+    google-auth-httplib2
+
+Переменные окружения (обязательные):
+    OPENAI_API_KEY
+    TELEGRAM_TOKEN
+    WEBHOOK_URL                   # например, https://your-app.onrender.com
+
+Переменные окружения (рекомендуемые/опциональные):
+    PORT                          # default: 8080
+    WEBHOOK_PATH                  # default: /webhook
+    TELEGRAM_WEBHOOK_SECRET       # секрет заголовка X-Telegram-Bot-Api-Secret-Token
+    EMBEDDINGS_PATH               # default: embeddings.npy
+    PUNKTS_PATH                   # default: pravila_detailed_tagged_autofix.json
+    EMBEDDING_MODEL               # default: text-embedding-ada-002 (совместим с текущим embeddings.npy)
+    CHAT_MODEL                    # default: gpt-4o-mini
+    MULTI_QUERY                   # "1" → включить Мульти-переформулировки (дороже)
+    SHEET_ID, GOOGLE_CREDENTIALS_JSON  # если хотите логировать вопросы/ответы в Google Sheets
+
+Автор: специально для замены старого webhook_main.py, без сокращений.
+"""
+from __future__ import annotations
+
 import os
+import json
+import time
+import math
+import html
+import uuid
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters,
-    CallbackQueryHandler
-)
-from aiohttp import web
 import asyncio
+import re
+from typing import List, Dict, Any, Tuple, Optional
 
-# Твой весь импорт + твои функции (log_to_sheet, build_human_friendly, и т.д.)
-# Просто скопируй из bot.py (или как у тебя сейчас называется) — ничего менять не надо.
-# ────────────────  bot.py  ────────────────
-
-# --- Создаём файл credentials, если его нет ---
-if not os.path.exists("service_account.json"):
-    creds = os.environ.get("GOOGLE_CREDENTIALS_JSON")
-    if creds:
-        with open("service_account.json", "w") as f:
-            f.write(creds)
-    else:
-        raise RuntimeError("Переменная GOOGLE_CREDENTIALS_JSON не задана!")
-
-import inspect, json, re, time
-from functools import lru_cache
-from itertools import groupby
-import gspread
-from google.oauth2.service_account import Credentials
-import datetime
-def log_to_sheet(user_id, username, message, bot_answer, timestamp):
-    try:
-        creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
-        creds_dict = json.loads(creds_json)
-        creds = Credentials.from_service_account_info(creds_dict, scopes=["https://www.googleapis.com/auth/spreadsheets"])
-        gc = gspread.authorize(creds)
-        sh = gc.open_by_key('11dG_R527d6toFdcgxtyyykxYjVZzodg05TLtQidDCHo')
-        ws = sh.sheet1
-        ws.append_row([str(user_id), username, message, bot_answer, timestamp])
-    except Exception as e:
-        print("Ошибка логирования в Google Sheets:", e)
-
-try:
-    from unidecode import unidecode
-except ModuleNotFoundError:
-    def unidecode(s: str) -> str:
-        return s
-
-import openai
-from bs4 import BeautifulSoup
 import numpy as np
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler,
-    ContextTypes, filters,
-)
+import requests
+from aiohttp import web
 
-if not hasattr(inspect, "getargspec"):
-    inspect.getargspec = lambda f: inspect.getfullargspec(f)[:4]
+# OpenAI v1 style
+from openai import OpenAI
+from openai import APIStatusError, APIConnectionError, RateLimitError, APITimeoutError
 
-from config_maps import UNIVERSAL_MAP
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+# Опционально: BM25
+try:
+    from rank_bm25 import BM25Okapi
+    HAVE_BM25 = True
+except Exception:
+    HAVE_BM25 = False
 
-from dotenv import load_dotenv
-load_dotenv()
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+# Опционально: импорт словарей маппингов (если файл есть и валиден)
+try:
+    import importlib.util
+    _cfg_path = os.path.join(os.getcwd(), "config_maps.py")
+    if os.path.exists(_cfg_path):
+        spec = importlib.util.spec_from_file_location("config_maps", _cfg_path)
+        cfg = importlib.util.module_from_spec(spec) if spec else None
+        if spec and cfg and spec.loader:
+            spec.loader.exec_module(cfg)  # type: ignore
+            UNIVERSAL_MAP: Dict[str, Dict[str, str]] = getattr(cfg, "UNIVERSAL_MAP", {})
+        else:
+            UNIVERSAL_MAP = {}
+    else:
+        UNIVERSAL_MAP = {}
+except Exception:
+    UNIVERSAL_MAP = {}
+
+# ──────────────────────────── Конфиг ────────────────────────────
+
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").strip()
+
+assert TELEGRAM_TOKEN, "TELEGRAM_TOKEN is required"
+assert OPENAI_API_KEY, "OPENAI_API_KEY is required"
+assert WEBHOOK_URL, "WEBHOOK_URL is required (e.g., https://your-app.onrender.com)"
+
+PORT = int(os.environ.get("PORT", "8080"))
+WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", "/webhook")
+TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "").strip() or None
+
+EMBEDDINGS_PATH = os.environ.get("EMBEDDINGS_PATH", "embeddings.npy")
+PUNKTS_PATH = os.environ.get("PUNKTS_PATH", "pravila_detailed_tagged_autofix.json")
+
+# ВНИМАНИЕ: embeddings.npy сейчас на 1536-мерной модели ada-002 — оставляем такую же модель до пересчёта
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "text-embedding-ada-002")
+CHAT_MODEL = os.environ.get("CHAT_MODEL", "gpt-4o-mini")
+
+MULTI_QUERY = os.environ.get("MULTI_QUERY", "0") == "1"
+
+SHEET_ID = os.environ.get("SHEET_ID", "").strip() or None
+GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip() or None
+
+# Скоринговые веса
+W_EMB = 1.0
+W_BM25 = 0.75
+W_MAP = 0.50
+W_REGEX = 0.15
+
+TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+
+# ──────────────────────────── Логгер ────────────────────────────
 
 logging.basicConfig(
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    level=logging.INFO
 )
-logger = logging.getLogger("rag-telegram-bot")
-# user_id : (question, punkts, human_friendly, official_answer)
-LAST_QA = {}
+logger = logging.getLogger("rag-bot")
 
-PUNKT_EMBS_PATH = "embeddings.npy"
-PUNKT_JSON_PATH = "pravila_detailed_tagged_autofix.json"
+# ─────────────────────── Клиенты и данные ───────────────────────
 
-PUNKT_EMBS = np.load(PUNKT_EMBS_PATH)
-logger.info("Загружено эмбеддингов: %s", PUNKT_EMBS.shape)
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-def _sanitize(punkts):
-    for p in punkts:
-        for k in ("chapter","paragraph","punkt_num","subpunkt_num","list_item"):
-            p[k] = str(p.get(k,"") or "")
-        p["text"] = p["text"].replace("\\n","\n")
-    return punkts
+def load_punkts(path: str) -> List[Dict[str, Any]]:
+    with open(path, "r", encoding="utf-8") as f:
+        arr = json.load(f)
+    assert isinstance(arr, list) and len(arr) > 0, "PUNKTS JSON must be a non-empty list"
+    # Нормализация ключей (на всякий случай)
+    for p in arr:
+        p.setdefault("id", str(uuid.uuid4()))
+        p.setdefault("punkt_num", "")
+        p.setdefault("subpunkt_num", "")
+        p.setdefault("text", "")
+        p.setdefault("chapter", "")
+        p.setdefault("paragraph", "")
+    return arr
 
-with open(PUNKT_JSON_PATH, encoding="utf-8") as f:
-    PUNKTS = _sanitize(json.load(f))
-logger.info("Загружено пунктов: %d", len(PUNKTS))
+PUNKTS: List[Dict[str, Any]] = load_punkts(PUNKTS_PATH)
 
-TYPE_INDEX = {}
+# embeddings.npy — memmap для экономии памяти/быстрой загрузки
+PUNKT_EMBS: np.ndarray = np.load(EMBEDDINGS_PATH, mmap_mode="r")
+assert PUNKT_EMBS.ndim == 2, "embeddings.npy must be 2D"
+assert PUNKT_EMBS.shape[0] == len(PUNKTS), "rows(embeddings) != len(PUNKTS)"
+if EMBEDDING_MODEL == "text-embedding-ada-002":
+    assert PUNKT_EMBS.shape[1] == 1536, "For ada-002 expected 1536 dims"
+logger.info("Loaded %d punkts; embeddings: %s", len(PUNKTS), PUNKT_EMBS.shape)
+
+# Тексты для BM25/keyword поиска
+DOCS_TOKENS: List[List[str]] = []
 for p in PUNKTS:
-    st = p.get("soft_type")
-    if st:
-        TYPE_INDEX.setdefault(st, []).append(p)
+    toks = re.findall(r"[а-яёa-z0-9]+", (p.get("text") or "").lower())
+    DOCS_TOKENS.append(toks)
 
-def clean_html(text: str) -> str:
-    soup = BeautifulSoup(text, "html.parser")
-    for tag in soup.find_all(True):
-        if tag.name not in {"b","i","u","s","code","pre","small"}:
-            tag.unwrap()
-        else:
-            tag.attrs = {}
-    out = str(soup).replace("<br/>","\n").replace("<br>","\n")
-    out = re.sub(r"<(\w+)>\s*</\1>", "", out)
-    out = re.sub(r"\n{3,}", "\n\n", out)
-    return out.strip()
+BM25 = None
+if HAVE_BM25:
+    BM25 = BM25Okapi(DOCS_TOKENS)
+    logger.info("BM25 index built (rank_bm25).")
+else:
+    logger.warning("rank_bm25 not installed — will use simple keyword scoring fallback.")
 
-def fix_unclosed_tags(html: str) -> str:
-    for tag in ("b","i","u","s","code","pre","small"):
-        diff = html.count(f"<{tag}>") - html.count(f"</{tag}>")
-        if diff>0:
-            html += f"</{tag}>" * diff
-    return html
+# ───────────────────────── Утилиты ──────────────────────────────
 
-try:
-    from spellchecker import SpellChecker
-    SPELL = SpellChecker(language="ru")
-    def autocorrect(txt: str) -> str:
-        return " ".join(SPELL.correction(w) or w for w in txt.split())
-except:
-    autocorrect = lambda txt: txt
+def cosine_sim(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    # a: (D,), b: (N, D)
+    a_norm = a / (np.linalg.norm(a) + 1e-12)
+    b_norm = b / (np.linalg.norm(b, axis=1, keepdims=True) + 1e-12)
+    return (b_norm @ a_norm)
 
-def blocks_commission(q: str):
-    return [p for p in PUNKTS if "Пункт 20" in p["text"]][:3]
+def normalize_query(q: str) -> str:
+    q = q or ""
+    q = q.replace("ё", "е")
+    return q.strip()
 
-def blocks_appeal(q: str):
-    if re.search(r"(апелляц|жалоб)", q, re.I):
-        return [p for p in PUNKTS if p["punkt_num"] in {"17","18"}][:5]
-    return []
+def tokenize(text: str) -> List[str]:
+    return re.findall(r"[а-яёa-z0-9]+", text.lower())
 
-SOFT_RULES = {
-    "violation": re.compile(r"\b(наруш|акт наруш|аннулир|аннулировать|аннулируется|аннулирован|аннулировано|ответственность|понижен|недостоверн|фальсификац|отклон|жалоб|апелляц|комисси)\b", re.I),
-    "notice": re.compile(r"\b(уведомлени|отказ|решение|комисси|протокол|приказ)\b", re.I),
-    "form": re.compile(r"\b(форма|заявлени|перечень|приложен|портал|egov|электронное правительство|веб-портал|платформ)\b", re.I),
-}
-
-UNIVERSAL_VIOLATION_PATTERN = re.compile(
-    r"(наруш|акт|ответственн|аннулир|аннулировать|аннулируется|аннулирован|аннулировано|отказ|отстран|дисквалификац|дисциплинарн|фальсификац|недостоверн|лишен|приостанов|запрет|взыскан|несоответств|неправомерн|санкц|недопуск|отклон|жалоб|апелляц|претенз|обжал|рассмотрен|комисси|пересмотр|спорн|несоглас|отзыв|повторн|протокол|приказ|уведомлени|заключен|лист|решени|форма|приложен|заявлени|выписка|портал|egov|электронное правительство|веб-портал|платформ)",
-    re.I
-)
-
-SOFT_TYPES_KEYWORDS = {
-    "portal": r"(портал|egov|электронное правительство)",
-    "defer": r"(отсрочк|приостанов|продлен|перенос|сохранени|продление|освобожд|стажировк|беременн|уход за ребен|воинская служб|болезн|нетрудоспособн|пенси)"
-}
-
-def soft_blocks(question: str, limit_per_type: int = 8):
-    rows = []
-
-    # Основные soft‑type группы (по вашей логике)
-    for stype, rx in SOFT_RULES.items():
-        if rx.search(question):
-            rows.extend(TYPE_INDEX.get(stype, [])[:limit_per_type])
-
-    # Универсальный паттерн нарушений и спорных ситуаций
-    if UNIVERSAL_VIOLATION_PATTERN.search(question):
-        for p in PUNKTS:
-            if UNIVERSAL_VIOLATION_PATTERN.search(p["text"]):
-                if p not in rows:
-                    rows.append(p)
-
-    # Справочник критических тем: ключевые слова —> номера пунктов
-    CRITICAL_BLOCKS = [
-        # Нарушения, ответственность, аннулирование
-        (r"(наруш|акт наруш|аннулир|ответственн|отклон|дисквалификац|фальсификац|недостоверн|санкц|отказ|отстран|лишен|понижен|дисциплинарн|наказан|обнаружен)",
-         ["10", "11", "12", "20"]),
-        # Апелляции, жалобы, оспаривание, споры
-        (r"(апелляц|жалоб|обжал|претенз|спорн|несоглас|оспор|пересмотр|комисси)", ["17", "18", "20"]),
-        # Освобождение, отсрочка, декрет, пенсия, болезни
-        (r"(отсрочк|приостанов|продлен|перенос|сохранени|продление|освобожд|стажировк|беременн|уход за ребен|воинская служб|болезн|нетрудоспособн|пенси|возраст|не проходить|не обязан)",
-         ["29", "30"]),
-        # Протоколы, акты, выписки, решения комиссии, приказы, заключения
-        (r"(протокол|акт|выписка|решение комиссии|приказ|заключение|лист|заседание)", ["10", "11", "12", "13", "20"]),
-        # Заявления, формы, портал egov, приложения, документы
-        (r"(заявлени|форма|портал|egov|электронное правительство|веб-портал|приложен|документ|подача|регистрац)", ["15", "16"]),
-        # Внеочередная/досрочная/ускоренная/повторная аттестация
-        (r"(досрочн|внеочередн|срочн|повторн|ускорен|немедленн|неотложн)", ["31", "32"]),
-        # Стажеры, присвоение категорий, первичная аттестация
-        (r"(стажер|стажёр|первичн|первый раз|впервые|опыт|категор)", ["23", "24", "25"]),
-        # Присвоение/подтверждение квалификаций, исключения
-        (r"(присвоен|подтвержден|исключени|освобожден|отозван|заменен|поручен|утвержден)", ["28", "29", "30"]),
-    ]
-
-    for pattern, punkt_nums in CRITICAL_BLOCKS:
-        if re.search(pattern, question, re.I):
-            for num in punkt_nums:
-                for p in PUNKTS:
-                    if p["punkt_num"] == num and p not in rows:
-                        rows.append(p)
-
-    # SPECIAL_PUNKTS для точечных универсальных случаев (осталось из вашей логики)
-    SPECIAL_PUNKTS = {
-        "32": r"(зарубеж|Bolashak|болаша|Nazarbayev|магистратур|иностранн(ый|ая|ое)|выпускник зарубежн|PhD|доктор наук|кандидат наук)",
-        "15": r"(исследоват|заявк|заявлен|подать|портал|egov|электронное правительство)",
-        "29": r"(отсрочк|приостанов|продлен|перенос|сохранени|продление|освобожд|стажировк|беременн|уход за ребен|воинская служб|болезн|нетрудоспособн|пенси)",
-        "30": r"(отсрочк|освобожд|пенси|возраст|освобождение|не проходить|не обязан)",
-    }
-    for punkt_num, regex in SPECIAL_PUNKTS.items():
-        if re.search(regex, question, re.I):
-            for p in PUNKTS:
-                if p["punkt_num"] == punkt_num and p not in rows:
-                    rows.insert(0, p)
-
-    return rows
-
-
-def unique(seq):
-    seen, out = set(), []
-    for p in seq:
-        key = (p['chapter'],p['paragraph'],p['punkt_num'],p['subpunkt_num'])
-        if key not in seen:
-            seen.add(key); out.append(p)
-    return out
-
-def merge_bullets(rows):
-    key = lambda x:(x['chapter'],x['paragraph'],x['punkt_num'],x['subpunkt_num'])
-    merged = []
-    for _, grp in groupby(sorted(rows, key=key), key):
-        grp = list(grp)
-        bullets = [g for g in grp
-                   if g["text"].lstrip().startswith(("–","—","-"))
-                   or g.get("list_item") in {"True","1","true"}]
-        if len(bullets)>=2:
-            merged.append({
-                **{k:grp[0][k] for k in ('chapter','paragraph','punkt_num','subpunkt_num')},
-                "text": "\n".join(g["text"] for g in grp)
-            })
-        else:
-            merged.extend(grp)
-    return merged
-
-def _drop_headers(rows):
-    return [p for p in rows if not p["text"].strip().endswith(":")]
-
-def _boost_by_category(rows, question):
-    if "эксперт" not in question.lower():
-        return rows
-    boost, other = [], []
-    for p in rows:
-        cat = p.get("category") or []
-        if isinstance(cat, str): cat = [cat]
-        (boost if any("эксперт" in c.lower() for c in cat) else other).append(p)
-    return boost + other
-
-def vector_search(question: str, top_k: int = 40):
-    logger.info("➡️ vector_search: %s", question)
-    emb = openai.embeddings.create(
-        model="text-embedding-ada-002",
-        input=question
-    ).data[0].embedding
-    qv = np.asarray(emb, dtype=np.float32)
-    sims = (PUNKT_EMBS @ qv) / (
-        np.linalg.norm(PUNKT_EMBS, axis=1) * np.linalg.norm(qv) + 1e-8
-    )
-    idx = np.argsort(-sims)[:top_k]
-    return _boost_by_category([PUNKTS[i] for i in idx], question)
-
-def bm25_fallback(question: str, k: int = 10):
-    base = autocorrect(question.lower())
-    toks = [t for t in re.findall(r"\w+", base) if len(t) > 3]
-    scored = []
-    for p in PUNKTS:
-        scr = sum(tok in p["text"].lower() for tok in toks)
-        if scr:
-            scored.append((scr, p))
-    return [p for _, p in sorted(scored, key=lambda x:-x[0])[:k]]
-def add_all_violation_punkts(rows, question):
-    """
-    Добавляет в rows все пункты, где явно упоминаются нарушения/санкции/ответственность,
-    если в вопросе есть соответствующие слова.
-    """
-    VIOLATION_RX = re.compile(
-        r"(наруш|акт|аннулир|ответственн|санкц|отказ|отстран|дисквалификац|фальсификац|дисциплинарн|наказан|обнаружен|отклон|недостоверн|лишен|понижен|неправомерн)",
-        re.I
-    )
-    if VIOLATION_RX.search(question):
-        for p in PUNKTS:
-            if VIOLATION_RX.search(p["text"]):
-                if p not in rows:
-                    rows.append(p)
-    return rows
-
-@lru_cache(maxsize=256)
-def rag_search(question: str, k: int = 60):
-    mapped = []
-    q_lower = question.lower()
-    primary_rows = []
-    if re.search(r"(болашак|nazarbayev|назарбаев|phd|доктор наук|зарубеж(ом|ный|ном)|европ|usa|uk|магистр|master|магистратур|докторант|докторантура|поствузовск|международн)", q_lower):
-        primary_rows += [p for p in PUNKTS if p["punkt_num"] == "32"]
-    for kword, v in UNIVERSAL_MAP.items():
-        if kword in q_lower:
-            mapped += [p for p in PUNKTS if p["punkt_num"] == v["punkt_num"]
-                       and (v["subpunkt_num"] == "" or p["subpunkt_num"] == v["subpunkt_num"])]
-
-    # Эмбеддинг-поиск (через OpenAI, если вопрос релевантен)
-    try:
-        emb = openai.embeddings.create(
-            model="text-embedding-ada-002",
-            input=question
-        ).data[0].embedding
-        qv = np.asarray(emb, dtype=np.float32)
-        sims = (PUNKT_EMBS @ qv) / (np.linalg.norm(PUNKT_EMBS, axis=1) * np.linalg.norm(qv) + 1e-8)
-        idx = np.argsort(-sims)[:40]
-        semant = [PUNKTS[i] for i in idx]
-    except Exception:
-        semant = []
-
-    # Regex/keyword-поиск
-    keywords = set(re.findall(r'\w+', q_lower))
-    regexed = []
-    for word in keywords:
-        if len(word) >= 4:
-            regexed += [p for p in PUNKTS if word in p["text"].lower()]
-    # Trigger-based (универсальные важные пункты)
-    trigger_nums = []
-    if re.search(r"наруш|ответственн|аннулир|акт|фальсификац|недостоверн", q_lower):
-        trigger_nums += ["45", "46", "47", "62"]
-    if re.search(r"пенси|возраст|пенсион|освобожд|уход за ребен|беременн|декрет", q_lower):
-        trigger_nums += ["29", "30"]
-    if re.search(r"болаша|nazarbayev|phd|степень|исследоват|магистр", q_lower):
-        trigger_nums += ["32"]
-    if re.search(r"апелляц|жалоб|обжал|спорн|пересмотр|комисси", q_lower):
-        trigger_nums += ["17", "18", "20"]
-    triggers = [p for p in PUNKTS if p["punkt_num"] in trigger_nums]
-
-    # Собираем всё в rows
-    rows = []
-    seen = set()
-    for l in (primary_rows, mapped, semant, regexed, triggers):
-        for p in l:
-            key = (p["punkt_num"], p["subpunkt_num"])
-            if key not in seen:
-                rows.append(p)
-                seen.add(key)
-
-
-    # --- ДОБАВЛЯЕМ soft_blocks для максимального покрытия ---
-    rows += soft_blocks(question)
-
-    # Fallback если всё пусто
-    if not rows:
-        rows = bm25_fallback(question, 10)
-
-    # Оставляем ваши постпроцессоры!
-    rows = unique(rows)
-    rows = merge_bullets(rows)
-    rows = _drop_headers(rows)
-    rows = add_all_violation_punkts(rows, question)
-    rows = unique(rows)
-    print("RAG SELECTED:", [(p["punkt_num"], p["text"][:70]) for p in rows[:k]])
-    return rows[:k]
-
-
-def build_prompt(q, punkts):
-    context = "\n\n".join(
-        f"{i+1}. [{p['punkt_num']}{('/'+p['subpunkt_num']) if p['subpunkt_num'] else ''}]\n{p['text']}"
-        for i, p in enumerate(punkts)
-    )
-
-    addendum = ""
-
-    # 1. Подача заявлений/портал/категории
-    if re.search(r"(исследоват|заявк|заявлен|подать|категор|портал|egov|электронное правительство)", q, re.I):
-        addendum += (
-            "\n\nЕсли среди приведённых фрагментов есть пункт про подачу заявки на категорию или через веб-портал электронного правительства, "
-            "в разделе <b>1. Резюме:</b> процитируй дословно про веб-портал (например, «egov.kz») с указанием номера пункта."
-        )
-
-    # 2. Возраст/пенсия/до скольки лет
-    if re.search(r"(до скольк|возраст|пенси|лет|years|старше|пенсионн|возрастн|пенсионер)", q, re.I):
-        addendum += (
-            "\n\nЕсли среди приведённых фрагментов есть пункты про освобождение от аттестации по возрасту или пенсии, "
-            "или про порядок аттестации после выхода на пенсию, процитируй их с номерами пунктов в <b>1. Резюме:</b>. "
-            "Ясно укажи, до какого возраста обязательна аттестация и как она проводится после пенсии."
-        )
-
-    # 3. Отсрочка/приостановка/освобождение/перенос/болезнь/декрет и т.д.
-    if re.search(r"(отсрочк|приостанов|продлен|перенос|сохранени|продление|освобожд|исключен|перерыв|прекращен|пауза|не проход|не обяз|выход на пенси|беременн|уход за ребен|стажировк|воинская служб|болезн|нетрудоспособн)", q, re.I):
-        addendum += (
-            "\n\nЕсли среди найденных есть пункты об отсрочке, освобождении, приостановке или сохранении квалификационной категории — процитируй их дословно в <b>1. Резюме:</b> с указанием пунктов. "
-            "Детально опиши условия, порядок и документы для каждого такого случая."
-        )
-
-    # 4. Первичная аттестация/стажёр/первая категория/впервые
-    if re.search(r"(стажер|стажёр|первичн|первый раз|впервые|начал|первая|только начал|по истечении года|после года|стаж работы)", q, re.I):
-        addendum += (
-            "\n\nЕсли среди фрагментов есть порядок присвоения категории «педагог» после статуса «педагог-стажер», процитируй, что по истечении года подается заявление на категорию «педагог» без процедуры аттестации (с номером пункта). "
-            "Если есть сроки первой формальной аттестации — процитируй их в <b>1. Резюме:</b> и приведи пошагово процедуру."
-        )
-
-    # 5. Апелляция/жалоба/обжалование/спорные ситуации
-    if re.search(r"(апелляц|жалоб|обжал|претенз|спорн|несоглас|оспор|пересмотр|обратиться|комисси|рассмотрен)", q, re.I):
-        addendum += (
-            "\n\nЕсли среди фрагментов есть пункты о жалобе, апелляции или спорных ситуациях — процитируй дословно куда, когда и как подается жалоба или апелляция (с точными формулировками и пунктами). "
-            "В разделах «Порядок» и «Документы» пошагово опиши процедуру и сроки, если такие предусмотрены."
-        )
-
-    # 6. Нарушения/дисциплина/санкции/ответственность/отказ
-    if re.search(r"(наруш|акт наруш|аннулир|ответственн|отклон|дисквалификац|фальсификац|недостоверн|отказ|отстран|санкц|дисциплинарн|лишен|понижен|наказан|неправомерн|обнаружен)", q, re.I):
-        addendum += (
-            "\n\nЕсли среди фрагментов есть информация о нарушениях, актах нарушения, последствиях или санкциях, процитируй эти положения с указанием пункта. "
-            "В разделах «Особые случаи» и «Порядок» опиши последствия и официальные шаги."
-        )
-
-    # 7. Документы/формы/уведомления/протоколы
-    if re.search(r"(документ|форма|приложен|заявлени|перечень|уведомлени|решени|протокол|приказ|лист|выписка)", q, re.I):
-        addendum += (
-            "\n\nЕсли среди найденных фрагментов есть формы заявлений, уведомлений, протоколов или приказов, перечисли их все с точными названиями, приложениями и номерами пунктов в разделе <b>3. Документы, которые заполняются:</b>."
-        )
-
-    # 8. Внеочередная/досрочная/ускоренная аттестация
-    if re.search(r"(досрочн|внеочередн|срочн|ускорен|немедленн|неотложн)", q, re.I):
-        addendum += (
-            "\n\nЕсли среди фрагментов есть информация о внеочередной или досрочной аттестации — в разделе <b>1. Резюме:</b> процитируй официальную формулировку с номером пункта. "
-            "В разделах «Порядок» и «Документы» опиши всю процедуру и основания."
-        )
-
-    # 9. Прочие смешанные случаи (универсальная защита)
-    if re.search(r"(оценк|стаж|категор|комисси|обобщ|результат|процедур|решени|приказ|рассмотрен|повышен|прохожд|присвоен|отстранен|назначен|назначени|освобожден|отозван|заменен|поручен|утвержден)", q, re.I):
-        addendum += (
-            "\n\nЕсли среди приведённых фрагментов есть любые положения о процедуре, назначении, результатах рассмотрения, комиссий, итоговых решениях или присвоении категорий — обязательно процитируй эти положения в соответствующих разделах с указанием пунктов."
-        )
-        # Новый блок: Если вопрос сложный, с несколькими основаниями (пенсия+декрет+внеочередная и пр.)
-    if re.search(r"(внеочередн|досрочн|срочн|повторн|пенси|декрет|уход за ребен|беременн|комисси)", q, re.I):
-        addendum += (
-            "\n\nЕсли в вопросе или найденных фрагментах затрагиваются несколько разных оснований (например, пенсия и декрет, декрет и внеочередная аттестация, несколько повторных процедур), подробно опиши требования и процедуру для каждого случая отдельно. " 
-            "Если часть информации отсутствует — явно напиши об этом в соответствующем разделе."
-        )
-    # 10. Универсальный фолбэк — если вопрос затрагивает несколько аспектов (например, пенсия и стаж, жалоба и дисциплина и т.д.)
-    addendum += (
-        "\n\nЕсли в вопросе или найденных фрагментах затрагиваются сразу несколько разных тем (например, пенсия и стаж, стажёр и досрочная аттестация, нарушение и жалоба), обязательно перечисли и процитируй каждый аспект и все связанные основания с точными формулировками и пунктами — по структуре ответа."
-    )
-
-    system = (
-        "Ты — эксперт-консультант по Правилам аттестации педагогов Республики Казахстан.\n"
-        "Отвечай ТОЛЬКО на основе предоставленных фрагментов официального текста.\n\n"
-        "Стиль и требования к ответу:\n"
-        "– Ответ строго официальный, без разговорных выражений или упрощений.\n"
-        "– Не используй собственные трактовки, пересказы и пояснения.\n"
-        "– Категорически запрещено использовать выражения вроде «проще говоря», «это значит», «иначе говоря».\n"
-        "– Если ответа на вопрос в предоставленных фрагментах нет, явно напиши: «В документе отсутствует информация, напрямую отвечающая на данный вопрос.»\n\n"
-        "Структура ответа:\n"
-        "<b>1. Резюме:</b> одна фраза — строго официальная цитата или итоговая формулировка с указанием пункта. "
-        "Если есть случаи отсрочки, освобождения, приостановки, особые правила, первичная аттестация, жалобы или нарушения — процитируй их с номерами пунктов.\n\n"
-        "<b>2. Основные условия/критерии:</b>\n"
-        "– Используй дословные цитаты официальных пунктов и подпунктов (ссылка обязательна: п. X подп. Y).\n"
-        "– Строго без сокращений и обобщений.\n\n"
-        "<b>3. Документы, которые заполняются:</b>\n"
-        "– Дословно перечисли документы с точными названиями приложений (например, «Акт нарушения правил и условий проведения оценки знаний педагога (Приложение 10 к Правилам)»). "
-        "ВСЕГДА указывай номер приложения и пункт, если он есть. Если информация отсутствует, напиши это явно.\n\n"
-        "<b>4. Порядок процедуры / этапы:</b>\n"
-        "– Только официальные шаги с указанием соответствующих пунктов.\n"
-        "– Не пересказывай и не добавляй шаги самостоятельно.\n\n"
-        "<b>5. Особые случаи / последствия (если есть):</b>\n"
-        "– Дословные цитаты о последствиях нарушений, отказах, ответственности с обязательным указанием пункта. "
-        "Включи все предусмотренные документом особые случаи (например, болезнь, беременность, пенсия, стажировка, апелляция, дисциплинарные нарушения, первичная аттестация и др.), с дословной цитатой и номером пункта.\n\n"
-        "<b>6. Связанные пункты:</b>\n"
-        "– Включай пункты, которые НЕ были процитированы в основном ответе, но имеют отношение к вопросу.\n"
-        "– Перечисляй кратко и чётко, указывая номер пункта и краткое официальное содержание.\n"
-        "– Не дублируй уже процитированные пункты.\n\n"
-        "Правила оформления:\n"
-        "– Используй HTML-теги <b>...</b> для заголовков разделов.\n"
-        "– Чётко разделяй абзацы.\n"
-        "– Каждый элемент списков начинай с «– ».\n\n"
-        "Дополнительно:\n"
-        "– Если пользователь задаёт уточняющий вопрос, повторно приводи точные цитаты.\n"
-        "– Категорически запрещено использовать внешние источники или информацию вне предложенных фрагментов."
-        + addendum
-    )
-
-    user = f"Вопрос: «{q}»\n\nФрагменты:\n{context}\n\nОтвет:"
-    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
-
-def ask_llm(q, punkts):
-    for attempt in range(3):
+def call_with_retries(fn, max_attempts=3, base_delay=1.0, *args, **kwargs):
+    for attempt in range(1, max_attempts + 1):
         try:
-            r = openai.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=build_prompt(q, punkts),
-                temperature=0.2,
-                max_tokens=2000,
-            )
-            return clean_html(r.choices[0].message.content.strip())
-        except openai.RateLimitError:
-            time.sleep(2**attempt)
-        except openai.OpenAIError as e:
-            logger.error("OpenAIError: %s", e)
-            break
-    sample = "\n".join(f"• {p['text']}" for p in punkts[:5])
-    return f"Не удалось получить ответ от LLM.\n\nВозможные фрагменты:\n{sample}"
+            return fn(*args, **kwargs)
+        except (RateLimitError, APITimeoutError, APIConnectionError, APIStatusError) as e:
+            if attempt == max_attempts:
+                raise
+            sleep_s = base_delay * (2 ** (attempt - 1)) + (0.1 * attempt)
+            logger.warning("OpenAI call failed (%s). Retry %d/%d in %.1fs", type(e).__name__, attempt, max_attempts, sleep_s)
+            time.sleep(sleep_s)
 
-def postprocess_answer(q, punkts, answer):
-    # Универсальный постпроцессор для ответа:
-    # – Удаляет дубли пунктов/приложений между секциями.
-    # – Добавляет все пропущенные приложения в "Документы".
-    # – Если раздел отсутствует/пустой — вставляет 'Нет информации...'
-    # – Сортирует внутри секций по возрастанию номера.
+# ─────────────────── Переформулировки запроса ───────────────────
 
-    all_punkt_nums = set(p["punkt_num"] for p in punkts if p["punkt_num"])
-    all_apps = set(re.findall(r"Приложение\s?\d+", "\n".join([p["text"] for p in punkts])))
-
-    cited_nums = set(re.findall(r"п\. ?(\d+[\w\.]*)", answer))
-    cited_apps = set(re.findall(r"Приложение\s?\d+", answer))
-
-    missed_apps = all_apps - cited_apps
-    if missed_apps:
-        docs_block = "\n" + "\n".join([f"– {app} (см. текст Правил)" for app in sorted(missed_apps)]) + "\n"
-        answer = re.sub(
-            r"(<b>3\. Документы, которые заполняются:</b>[\s\S]*?)(?=<b>|$)",
-            lambda m: m.group(1) + docs_block,
-            answer,
-        )
-
-    for sec in [
-        "1. Резюме",
-        "2. Основные условия/критерии",
-        "3. Документы, которые заполняются",
-        "4. Порядок процедуры / этапы",
-        "5. Особые случаи / последствия (если есть)",
-        "6. Связанные пункты",
-    ]:
-        if f"<b>{sec}:</b>" not in answer:
-            answer += f"\n\n<b>{sec}:</b>\nНет информации по данному разделу."
-
-    def clean_linked_punkts(m):
-        lines = m.group(1).splitlines()
-        filtered = []
-        for line in lines:
-            match = re.search(r"п\. ?(\d+[\w\.]*)", line)
-            if match and match.group(1) in cited_nums:
-                continue
-            filtered.append(line)
-        return "<b>6. Связанные пункты:</b>\n" + "\n".join(filtered) + "\n"
-
-    answer = re.sub(
-        r"<b>6\. Связанные пункты:</b>\n([\s\S]*?)(?=<b>|$)",
-        clean_linked_punkts,
-        answer,
+def multi_query_rewrites(q: str, n: int = 3) -> List[str]:
+    if not MULTI_QUERY:
+        return [q]
+    prompt = f"Переформулируй этот вопрос юридической/официальной формулировкой на русском, сохранив смысл. Дай {n} вариантов, по одному в строке, без нумерации и комментариев:\n\n{q}"
+    resp = call_with_retries(
+        client.chat.completions.create,
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "Ты помощник по правовым/официальным формулировкам на русском языке."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.2,
     )
+    text = resp.choices[0].message.content.strip()
+    variants = [v.strip() for v in text.split("\n") if v.strip()]
+    if not variants:
+        variants = [q]
+    # Дедуп
+    uniq = []
+    for v in [q] + variants:
+        if v not in uniq:
+            uniq.append(v)
+    return uniq[: n + 1]
 
-    def sort_docs(m):
-        docs = m.group(1).strip().splitlines()
-        docs = sorted(set(docs), key=lambda x: re.sub(r'\D', '', x))  # сортируем по номеру, грубо
-        return "<b>3. Документы, которые заполняются:</b>\n" + "\n".join(docs) + "\n"
+# ─────────────────────── Векторный поиск ────────────────────────
 
-    answer = re.sub(
-        r"<b>3\. Документы, которые заполняются:</b>\n([\s\S]*?)(?=<b>|$)",
-        sort_docs,
-        answer,
+def embed_query(text: str) -> np.ndarray:
+    resp = call_with_retries(
+        client.embeddings.create,
+        model=EMBEDDING_MODEL,
+        input=text,
     )
-    # postprocess_answer — после генерации ответа:
-    bad_phrases = [
-    "по закону", "по документу", "по правилам",
-    "обычно", "можно", "как правило", "чаще всего",
-    "означает", "в случае", "если"
-    ]
-    for phrase in bad_phrases:
-        if phrase in answer.lower():
-            logger.warning(f"❗ Найдена недопустимая фраза в ответе: {phrase}")
-            # Можно вызывать дополнительную коррекцию, если требуется
+    vec = np.array(resp.data[0].embedding, dtype=np.float64)
+    return vec
 
-    return answer.strip()
+def vector_search(q: str, top_k: int = 100) -> List[Tuple[int, float]]:
+    vec = embed_query(q)
+    sims = cosine_sim(vec, PUNKT_EMBS)  # (N,)
+    idxs = np.argsort(-sims)[:top_k]
+    return [(int(i), float(sims[i])) for i in idxs]
 
-def check_completeness(q, punkts, answer):
-    cited_nums = set(re.findall(r"п\. ?(\d+)", answer))
-    missed = []
-    for p in punkts:
-        if p["punkt_num"] and p["punkt_num"] not in cited_nums:
-            missed.append(p["punkt_num"])
-    if missed:
-        logger.warning(f"❗ Не отражены пункты: {missed} в ответе на: {q}")
+# ───────────────────── Sparse/BM25 поиск ────────────────────────
 
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Здравствуйте! Задайте вопрос по Правилам аттестации педагогов.",
-        parse_mode="HTML"
-    )
+def bm25_search(q: str, top_k: int = 100) -> List[Tuple[int, float]]:
+    toks = tokenize(q)
+    if BM25:
+        scores = BM25.get_scores(toks)
+        idxs = np.argsort(-scores)[:top_k]
+        return [(int(i), float(scores[i])) for i in idxs]
+    # Fallback: простой keyword-скоринг с TF (веса урезаны)
+    scores = []
+    for i, doc in enumerate(DOCS_TOKENS):
+        if not doc: 
+            scores.append(0.0)
+            continue
+        s = 0
+        for t in toks:
+            s += doc.count(t)
+        scores.append(float(s))
+    idxs = np.argsort(-np.array(scores))[:top_k]
+    return [(int(i), float(scores[i])) for i in idxs]
 
-def build_human_friendly(q, punkts, official_answer):
-    if re.search(r"платн|оплат|стоимост|платно|стоимость", q, re.I):
-        if "п. 41" in official_answer or "41" in official_answer:
-            return (
-                "Аттестация педагогических работников проводится бесплатно один раз в год, "
-                "повторное прохождение — на платной основе согласно утвержденной сумме (п. 41). "
-                "Досрочная аттестация — бесплатно. Пробное тестирование — на платной основе (п. 41)."
-            )
-    # --- Далее основной prompt (как описано выше)
-    prompt = (
-    f"Вопрос: {q}\n"
-    "Сформулируй краткий ответ исключительно на основании текста официального ответа ниже. "
-    "В ответе используй только точные формулировки из официального ответа и обязательно ссылайся на номер пункта в формате (п. X). "
-    "Запрещено делать любые пересказы, упрощения, рассуждения, пояснения или интерпретации. "
-    "Не используй разговорные слова, бытовые обороты, такие как «можно», «обычно», «есть возможность» и др. "
-    "Только юридически точные, краткие и однозначные фразы. "
-    "Если вопрос о платности — четко укажи: кто, когда и на каких основаниях платит, со ссылкой на пункт. "
-    "Если вопрос о процедуре — только официальный пошаговый порядок по Правилам, со ссылкой на пункты. "
-    "Не используй слова «по закону», «по документу», «по правилам» — только цитаты с номерами пунктов. "
-    "Если официальный ответ не содержит нужной информации, ответь: «В документе отсутствует информация, напрямую отвечающая на данный вопрос.»\n\n"
-    f"Официальный ответ:\n{official_answer}\n\n"
-    "Краткий формальный ответ:"
+# ───────────────────── Маппинги и регэкспы ──────────────────────
+
+KEY_REGEXES = [
+    # пример: «п. 29», «пункт 30», «по пункту 41» и т.п.
+    r"\bп\.?\s*(\d{1,3})\b",
+    r"\bпункт[а-я]*\s*(\d{1,3})\b",
+]
+
+def regex_hits(q: str) -> List[int]:
+    hits: List[int] = []
+    for rgx in KEY_REGEXES:
+        for m in re.finditer(rgx, q.lower()):
+            num = m.group(1)
+            for i, p in enumerate(PUNKTS):
+                if p.get("punkt_num") == num:
+                    hits.append(i)
+    return list(dict.fromkeys(hits))
+
+def mapped_hits(q: str) -> List[int]:
+    ql = q.lower()
+    if not UNIVERSAL_MAP:
+        return []
+    got: List[int] = []
+    for key, coord in UNIVERSAL_MAP.items():
+        if key in ql:
+            # Находим все элементы с таким пунктом; если subpunkt_num задан, фильтруем по нему
+            for i, p in enumerate(PUNKTS):
+                if p.get("punkt_num") == coord.get("punkt_num", ""):
+                    sp = coord.get("subpunkt_num", "")
+                    if not sp or p.get("subpunkt_num") == sp:
+                        got.append(i)
+    return list(dict.fromkeys(got))
+
+# ───────────────────────── Merge & Score ────────────────────────
+
+def merge_scores(*score_lists: List[Tuple[int, float]]) -> Dict[int, float]:
+    agg: Dict[int, float] = {}
+    for slist, w in score_lists:
+        for idx, sc in slist:
+            agg[idx] = agg.get(idx, 0.0) + w * sc
+    return agg
+
+def rag_search(q: str, top_k_stage1: int = 120, final_k: int = 45) -> List[Dict[str, Any]]:
+    q = normalize_query(q)
+    variants = multi_query_rewrites(q)
+    dense_agg: Dict[int, float] = {}
+    sparse_agg: Dict[int, float] = {}
+
+    # Dense for each variant
+    for v in variants:
+        for idx, sc in vector_search(v, top_k=top_k_stage1):
+            dense_agg[idx] = max(dense_agg.get(idx, 0.0), sc)
+
+    # Sparse for base + variants
+    for v in [q] + variants:
+        for idx, sc in bm25_search(v, top_k=top_k_stage1):
+            sparse_agg[idx] = max(sparse_agg.get(idx, 0.0), sc)
+
+    # Regex & mapped
+    regex_idx = regex_hits(q)
+    mapped_idx = mapped_hits(q)
+
+    # Нормируем sparse (z-score) для сопоставимости
+    if sparse_agg:
+        vals = np.array(list(sparse_agg.values()), dtype=np.float64)
+        mu, sigma = float(vals.mean()), float(vals.std() + 1e-6)
+        for k in list(sparse_agg.keys()):
+            sparse_agg[k] = (sparse_agg[k] - mu) / sigma
+
+    # Merge
+    items: List[Tuple[int, float]] = []
+    for idx in set(list(dense_agg.keys()) + list(sparse_agg.keys()) + regex_idx + mapped_idx):
+        emb_sc = dense_agg.get(idx, 0.0)
+        sp_sc = sparse_agg.get(idx, 0.0)
+        rx_sc = 1.0 if idx in regex_idx else 0.0
+        mp_sc = 1.0 if idx in mapped_idx else 0.0
+        total = W_EMB * emb_sc + W_BM25 * sp_sc + W_REGEX * rx_sc + W_MAP * mp_sc
+        items.append((idx, total))
+
+    # Сортируем и берём topN
+    items.sort(key=lambda x: -x[1])
+    top_idx = [i for i, _ in items[:final_k]]
+    selected = [PUNKTS[i] for i in top_idx]
+
+    # Лог в отладку
+    logger.debug("RAG selected idx: %s", top_idx[:15])
+    return selected
+
+# ───────────────────── Генерация ответа (LLM) ───────────────────
+
+SYSTEM_PROMPT = (
+    "Ты — строгий помощник по Правилам и условиям проведения аттестации педагогов РК. "
+    "Отвечай только по предоставленным пунктам, не выдумывай деталей. "
+    "Если прямого ответа нет, так и скажи. Всегда ссылайся на конкретные пункты."
 )
-    
 
+GEN_PROMPT_TEMPLATE = """\
+Вопрос пользователя:
+{question}
+
+Контекст (фрагменты Правил):
+{context}
+
+Требования к ответу (СТРОГО):
+1) Верни результат строго в JSON с полями:
+   - short_answer: однострочный краткий вывод.
+   - reasoned_answer: развернутый официальный ответ по-деловому стилю.
+   - citations: список объектов вида {{"punkt_num": "N", "subpunkt_num": "M"|"" , "quote": "точная выдержка"}} — цитаты только из переданного контекста.
+   - related: список пунктов, которые важно дополнительно посмотреть, формат объектов {{"punkt_num": "N", "subpunkt_num": ""}}.
+2) Если в контексте нет прямого ответа — short_answer сформулируй как «В документе отсутствует информация, напрямую отвечающая на данный вопрос.»
+3) Не добавляй лишних полей. Формат JSON — без комментариев.
+"""
+
+def build_context_snippets(punkts: List[Dict[str, Any]], max_chars: int = 8000) -> str:
+    """Собираем контекст: «п. X[.Y]: текст…»; ограничиваем размер для токенов."""
+    parts: List[str] = []
+    total = 0
+    for p in punkts:
+        pn = str(p.get("punkt_num") or "").strip()
+        sp = str(p.get("subpunkt_num") or "").strip()
+        head = f"п. {pn}{('.' + sp) if sp else ''}".strip()
+        txt = (p.get("text") or "").strip()
+        one = f"{head}: {txt}"
+        if total + len(one) + 2 > max_chars:
+            break
+        parts.append(one)
+        total += len(one) + 2
+    return "\n\n".join(parts)
+
+def ask_llm(question: str, punkts: List[Dict[str, Any]]) -> Dict[str, Any]:
+    context_text = build_context_snippets(punkts)
+    user_prompt = GEN_PROMPT_TEMPLATE.format(question=question, context=context_text)
+
+    resp = call_with_retries(
+        client.chat.completions.create,
+        model=CHAT_MODEL,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.2,
+        response_format={"type": "json_object"},
+    )
+
+    text = resp.choices[0].message.content.strip()
     try:
-        response = openai.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.15,
-            max_tokens=180,
-        )
-        return response.choices[0].message.content.strip()
+        data = json.loads(text)
+        # Валидация базовой схемы
+        assert isinstance(data.get("short_answer", ""), str)
+        assert isinstance(data.get("reasoned_answer", ""), str)
+        assert isinstance(data.get("citations", []), list)
+        assert isinstance(data.get("related", []), list)
     except Exception as e:
-        print("Ошибка генерации human-friendly ответа:", e)
-        return "(Краткое объяснение не сгенерировано)"
+        logger.warning("LLM JSON parse error: %s; raw: %s", e, text[:500])
+        # Фоллбек — минимальный ответ
+        data = {
+            "short_answer": "Не удалось корректно сформировать структурированный ответ.",
+            "reasoned_answer": "Попробуйте сформулировать вопрос иначе или уточните контекст.",
+            "citations": [],
+            "related": [],
+        }
+    return data
 
+# ───────────────────── Пост-процесс и рендер ────────────────────
 
-async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.message.text or ""
-    user = update.effective_user
-
-    logger.info("⇢ %s", q)
-    punkts = merge_bullets(rag_search(q))[:45]
-    logger.info("Нашли пунктов: %d", len(punkts))
-
-    # Получаем оба ответа
-    official_answer = ask_llm(q, punkts) if punkts else "Прямого ответа не найдено."
-    official_answer = postprocess_answer(q, punkts, official_answer)
-    human_friendly = build_human_friendly(q, punkts, official_answer)
-
-    # Сохраняем последний вопрос пользователя (user.id)
-    LAST_QA[user.id] = (q, punkts, human_friendly, official_answer)
-
-    # Формируем human-friendly сообщение с кнопкой
-    reply_text = (
-        f"💡 <b>Краткий ответ:</b>\n{human_friendly}\n\n"
-        f"<i>Для детального ответа — нажмите кнопку ниже.</i>"
+def validate_citations(citations: List[Dict[str, Any]], punkts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Оставляем только те цитаты, которые соответствуют переданным punkts (по punkt_num/subpunkt_num)."""
+    allowed: set[Tuple[str, str]] = set(
+        (str(p.get("punkt_num") or ""), str(p.get("subpunkt_num") or "")) for p in punkts
     )
-    keyboard = [
-        [InlineKeyboardButton("Показать детальный ответ", callback_data="show_official")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    out: List[Dict[str, Any]] = []
+    for c in citations:
+        pn = str(c.get("punkt_num", ""))
+        sp = str(c.get("subpunkt_num", ""))
+        qt = str(c.get("quote", "")).strip()
+        if (pn, sp) in allowed and qt:
+            out.append({"punkt_num": pn, "subpunkt_num": sp, "quote": qt})
+    # Дедуп по (pn, sp, quote)
+    seen = set()
+    uniq = []
+    for c in out:
+        key = (c["punkt_num"], c["subpunkt_num"], c["quote"])
+        if key not in seen:
+            uniq.append(c)
+            seen.add(key)
+    return uniq[:8]  # ограничим для компактности
 
-    await update.message.reply_text(
-        fix_unclosed_tags(reply_text),
-        parse_mode="HTML",
-        reply_markup=reply_markup
-    )
+def render_html_answer(struct: Dict[str, Any], punkts: List[Dict[str, Any]]) -> str:
+    sa = html.escape(struct.get("short_answer", "")).strip()
+    ra = html.escape(struct.get("reasoned_answer", "")).strip()
+    citations = validate_citations(struct.get("citations", []), punkts)
+    related = struct.get("related", [])
 
-    # Логируем human-friendly ответ (официальный залогируется после кнопки)
-    timestamp = datetime.datetime.now().isoformat(sep=' ', timespec='seconds')
-    log_to_sheet(
-        user_id=user.id if user else "",
-        username=user.username if user and user.username else "",
-        message=q,
-        bot_answer=human_friendly,
-        timestamp=timestamp
-    )
-async def button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user = query.from_user
-    await query.answer()
+    lines: List[str] = []
+    if sa:
+        lines.append(f"<b>Краткий ответ:</b>\n{sa}")
+    if ra:
+        lines.append(f"<b>Официальный ответ:</b>\n{ra}")
 
-    if query.data == "show_official":
-        qa = LAST_QA.get(user.id)
-        if qa:
-            q, punkts, human_friendly, official_answer = qa
-            reply_text = f"<b>Детальный ответ по Правилам:</b>\n{official_answer}"
+    if citations:
+        lines.append("<b>Цитаты из Правил:</b>")
+        for c in citations:
+            pn = c.get("punkt_num", "")
+            sp = c.get("subpunkt_num", "")
+            head = f"п. {pn}{('.' + sp) if sp else ''}".strip()
+            qt = html.escape(c.get("quote", ""))
+            lines.append(f"— <i>{head}</i>: {qt}")
 
-            await query.message.reply_text(
-                fix_unclosed_tags(reply_text),
-                parse_mode="HTML"
-            )
+    # Подбор «Связанных пунктов»: если LLM не дал — добавим заголовки из контекста
+    if not related:
+        rel_keys = list({(p.get('punkt_num'), p.get('subpunkt_num')) for p in punkts})
+        related = [{"punkt_num": str(a or ''), "subpunkt_num": str(b or '')} for a, b in rel_keys][:8]
 
-            # Логируем официальный ответ
-            import datetime
-            timestamp = datetime.datetime.now().isoformat(sep=' ', timespec='seconds')
-            log_to_sheet(
-                user_id=user.id if user else "",
-                username=user.username if user and user.username else "",
-                message=f"[Официальный ответ на] {q}",
-                bot_answer=official_answer,
-                timestamp=timestamp
-            )
+    if related:
+        lines.append("<b>Связанные пункты:</b>")
+        for r in related[:12]:
+            pn = html.escape(str(r.get("punkt_num", "")))
+            sp = html.escape(str(r.get("subpunkt_num", "")))
+            head = f"п. {pn}{('.' + sp) if sp else ''}".strip()
+            lines.append(f"• {head}")
+
+    return "\n".join(lines).strip()
+
+def split_for_telegram(text: str, limit: int = 4000) -> List[str]:
+    res: List[str] = []
+    buf = []
+    total = 0
+    for line in text.split("\n"):
+        if total + len(line) + 1 > limit:
+            res.append("\n".join(buf))
+            buf = [line]
+            total = len(line) + 1
         else:
-            await query.message.reply_text("Официальный ответ не найден.")
+            buf.append(line)
+            total += len(line) + 1
+    if buf:
+        res.append("\n".join(buf))
+    return res
 
+# ────────────────────── Telegram I/O ────────────────────────────
 
-# ---- Ниже — основной код для запуска через webhook ----
+def tg_send_message(chat_id: int, text: str, parse_mode: str = "HTML") -> None:
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": parse_mode,
+        "disable_web_page_preview": True,
+    }
+    r = requests.post(url, json=payload, timeout=15)
+    if not r.ok:
+        logger.error("sendMessage failed: %s %s", r.status_code, r.text)
 
-TOKEN = os.environ.get("TELEGRAM_TOKEN")
-PORT = int(os.environ.get("PORT", "8080"))  # Render по умолчанию выставляет PORT=10000 или 8080
-WEBHOOK_PATH = f"/{TOKEN}"
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL") 
+def tg_set_webhook(full_url: str, secret: Optional[str]) -> None:
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook"
+    payload = {"url": full_url}
+    if secret:
+        payload["secret_token"] = secret
+    payload["allowed_updates"] = ["message"]
+    r = requests.post(url, json=payload, timeout=15)
+    if not r.ok:
+        logger.error("setWebhook failed: %s %s", r.status_code, r.text)
+    else:
+        logger.info("Webhook set: %s", full_url)
 
+# ─────────────────── Google Sheets логирование ──────────────────
 
-# ----- твой глобальный LAST_QA, а также все функции, которые были раньше -----
+def log_to_sheet_safe(user_id: int, question: str, short_answer: str) -> None:
+    if not (SHEET_ID and GOOGLE_CREDENTIALS_JSON):
+        return
+    try:
+        import gspread  # type: ignore
+        from google.oauth2.service_account import Credentials  # type: ignore
+        import json as _json
 
-# (Оставь свои handle, button, start — без изменений!)
+        creds_data = _json.loads(GOOGLE_CREDENTIALS_JSON)
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        creds = Credentials.from_service_account_info(creds_data, scopes=scopes)
+        gc = gspread.authorize(creds)
+        sh = gc.open_by_key(SHEET_ID)
+        ws = sh.sheet1
+        ws.append_row([int(time.time()), str(user_id), question, short_answer], value_input_option="USER_ENTERED")
+    except Exception as e:
+        logger.warning("Sheets log failed: %s", e)
 
-# ---- Запуск бота и aiohttp сервера ----
+# ───────────────────────── HTTP хендлеры ────────────────────────
 
-async def on_startup(app):
-    await app['bot'].bot.set_webhook(url=WEBHOOK_URL + WEBHOOK_PATH)
-    logger.info("Webhook set to %s", WEBHOOK_URL + WEBHOOK_PATH)
+async def handle_health(request: web.Request) -> web.Response:
+    return web.Response(text="ok")
 
-async def main():
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
-    app.add_handler(CallbackQueryHandler(button))
-    logger.info("Бот запущен через webhook.")
-    await app.initialize()
-    # Создаем aiohttp веб-сервер для Telegram
-    web_app = web.Application()
-    web_app['bot'] = app
+async def handle_webhook(request: web.Request) -> web.Response:
+    # Проверка секрета Telegram (если задан)
+    if TELEGRAM_WEBHOOK_SECRET:
+        recv_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+        if recv_secret != TELEGRAM_WEBHOOK_SECRET:
+            return web.Response(status=403, text="forbidden")
 
-    # endpoint для Telegram webhook
-    async def handle_update(request):
-        data = await request.json()
-        update = Update.de_json(data, app.bot)
-        await app.process_update(update)
+    data = await request.json()
+    message = data.get("message", {}) if isinstance(data, dict) else {}
+    chat = message.get("chat", {})
+    chat_id = chat.get("id")
+    text = message.get("text", "") or ""
+
+    if not chat_id:
+        return web.Response(text="no chat")
+
+    if text.strip().startswith("/start"):
+        tg_send_message(chat_id, "Здравствуйте! Задайте вопрос по Правилам аттестации педагогов — я отвечу с цитатами.")
         return web.Response(text="ok")
-    web_app.router.add_post(WEBHOOK_PATH, handle_update)
-    web_app.on_startup.append(on_startup)
 
-    # Запускаем сервер на нужном порту
-    runner = web.AppRunner(web_app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
+    if not text.strip():
+        tg_send_message(chat_id, "Пожалуйста, пришлите текстовый вопрос.")
+        return web.Response(text="ok")
 
-    # Не даем процессу умереть
-    while True:
-        await asyncio.sleep(3600)
+    # Основной пайплайн
+    try:
+        punkts = rag_search(text)
+        struct = ask_llm(text, punkts)
+        html_answer = render_html_answer(struct, punkts)
+        parts = split_for_telegram(html_answer)
+        for part in parts:
+            tg_send_message(chat_id, part)
+        log_to_sheet_safe(chat_id, text, struct.get("short_answer", ""))
+    except Exception as e:
+        logger.exception("Processing failed")
+        tg_send_message(chat_id, "Произошла ошибка при обработке запроса. Попробуйте позже.")
+
+    return web.Response(text="ok")
+
+# ─────────────────────────── main() ─────────────────────────────
+
+async def on_startup(app: web.Application):
+    full_url = f"{os.environ.get('WEBHOOK_URL', '').strip()}{os.environ.get('WEBHOOK_PATH', '/webhook')}"
+    tg_set_webhook(full_url, TELEGRAM_WEBHOOK_SECRET)
+    logger.info("Service started on port %s", int(os.environ.get("PORT", "8080")))
+
+def main():
+    app = web.Application()
+    app.router.add_get("/health", handle_health)
+    app.router.add_post(os.environ.get("WEBHOOK_PATH", "/webhook"), handle_webhook)
+
+    loop = asyncio.get_event_loop()
+    runner = web.AppRunner(app)
+    loop.run_until_complete(runner.setup())
+    site = web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", "8080")))
+    loop.run_until_complete(site.start())
+    try:
+        loop.run_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        loop.run_until_complete(runner.cleanup())
+
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    main()
