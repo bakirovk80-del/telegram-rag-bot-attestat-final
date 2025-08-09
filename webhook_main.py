@@ -123,6 +123,32 @@ W_BM25 = 0.75
 W_MAP = 1.25
 W_REGEX = 0.15
 
+W_KW = 0.9  # вес сигнала по ключевым словам для тематических исключений/зарубеж
+KW_EXCEPTION_TERMS = (
+    "без прохождения процедуры аттестации",
+    "присваивается без",
+    "освобожда",
+    "не подлежит аттестации",
+)
+KW_FOREIGN_TERMS = (
+    "зарубеж", "за пределами республики казахстан", "за границ",
+    "иностран", "nazarbayev university", "болаш",
+)
+def kw_boost(question: str, doc_text: str) -> float:
+    ql = (question or "").lower()
+    dl = (doc_text or "").lower()
+    boost = 0.0
+    foreign_q = any(k in ql for k in ("магист", "за рубеж", "за границ", "зарубеж", "иностран"))
+    if foreign_q:
+        if any(k in dl for k in KW_EXCEPTION_TERMS):
+            boost += 0.6
+        if any(k in dl for k in KW_FOREIGN_TERMS):
+            boost += 0.6
+    # общий случай: если в документе есть явное "без прохождения" — подбустим всегда
+    if any(k in dl for k in KW_EXCEPTION_TERMS):
+        boost += 0.3
+    return boost
+
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 # ──────────────────────────── Логгер ────────────────────────────
@@ -381,7 +407,9 @@ def rag_search(q: str, top_k_stage1: int = 120, final_k: int = 45) -> List[Dict[
         rx_sc  = 1.0 if idx in regex_idx  else 0.0
         mp_sc  = 1.0 if idx in mapped_idx else 0.0
         total  = W_EMB*emb_sc + W_BM25*sp_sc + W_REGEX*rx_sc + W_MAP*mp_sc
+        total += W_KW * kw_boost(q, PUNKTS[idx].get("text",""))
         items.append((idx, total))
+       
 
     # Сортировка и выбор top-K
     items.sort(key=lambda x: -x[1])
@@ -417,19 +445,14 @@ GEN_PROMPT_TEMPLATE = """\
 1) Верни результат строго в JSON с полями:
    - short_answer: однострочный краткий вывод.
    - reasoned_answer: 2–5 абзацев официального ответа по-деловому стилю с разбором общего случая и возможных исключений.
-   - citations: список объектов вида {{\"punkt_num\": \"N\", \"subpunkt_num\": \"M\"|\"\" , \"quote\": \"точная выдержка\"}} — цитаты только из переданного контекста.
-   - related: список пунктов, которые важно дополнительно посмотреть, формат {{\"punkt_num\": \"N\", \"subpunkt_num\": \"\"}}.
-2) Если специальной нормы нет — дай вывод по общим нормам Правил (укажи соответствующие пункты) и явно отметь отсутствие отдельного освобождения.
-3) ОБЯЗАТЕЛЬНО приложи не менее 2 (двух) цитат в \"citations\". 
-4) Каждый тезис подтверждай цитатой из соответствующего раздела: 
-   - \"кто обязан проходить\" → пункт с перечнем лиц/условий (общая норма), 
-   - \"исключение/без аттестации\" → специальный пункт, 
-   - \"периодичность/оплата\" → не используйте как доказательство обязанности.
-5) Не добавляй лишних полей. Формат JSON — без комментариев.
+   - citations: список объектов вида {{\"punkt_num\": \"N\", \"subpunkt_num\": \"M\"|\"\", \"quote\": \"точная выдержка\"}} — цитаты только из переданного контекста.
+   - related: список пунктов {{\"punkt_num\": \"N\", \"subpunkt_num\": \"\"}}.
+2) Если специальной нормы нет — дай вывод по общим нормам Правил и явно отметь отсутствие освобождения.
+3) Обязательно >= 2 цитат в \"citations\". Цитаты должны подтверждать ключевые тезисы.
+4) Запрещено использовать п.3 (периодичность) и п.41 (оплата/кол-во попыток) как доказательство обязанности проходить аттестацию. Эти пункты можно указывать только как справочную информацию.
+5) Если вопрос связан с иностранной магистратурой/зарубежным образованием, обязательно проверь и процитируй специальные нормы (например, о присвоении категории без прохождения процедуры, NU/перечень \"Болашақ\") при наличии в контексте.
+6) Не добавляй лишних полей. JSON — без комментариев.
 """
-
-
-
 
 def build_context_snippets(punkts: List[Dict[str, Any]], max_chars: int = 12000) -> str:
     
@@ -462,6 +485,14 @@ def ask_llm(question: str, punkts: List[Dict[str, Any]]) -> Dict[str, Any]:
         temperature=0.2,
         response_format={"type": "json_object"},
     )
+    def _needs_reask(question: str, data: Dict[str, Any]) -> bool:
+        ql = (question or "").lower()
+        if any(k in ql for k in ("магист", "за рубеж", "за границ", "зарубеж", "иностран")):
+            cited = {str(c.get("punkt_num","")) for c in data.get("citations", [])}
+        # если в цитатах нет ни 5, ни 32 — велика вероятность, что проигнорирована спец-норма
+            if not (("5" in cited) or ("32" in cited)):
+             return ("5" not in cited) and ("32" not in cited)
+    return False
 
     text = resp.choices[0].message.content.strip()
     try:
@@ -480,6 +511,28 @@ def ask_llm(question: str, punkts: List[Dict[str, Any]]) -> Dict[str, Any]:
             "citations": [],
             "related": [],
         }
+    # Перезапрос с ужесточением, если для "зарубеж/магистратура" не процитированы спец-нормы
+    try:
+        if _needs_reask(question, data):
+            extra = "\nВАЖНО: Пересобери ответ. Для вопросов про зарубежную магистратуру процитируй спец-нормы (п.5 и/или п.32) из переданного контекста, если они присутствуют; не опирайся на п.3/п.41 как на доказательство обязанности."
+            strict_prompt = GEN_PROMPT_TEMPLATE + extra
+            resp2 = call_with_retries(
+                client.chat.completions.create,
+                model=CHAT_MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": strict_prompt.format(question=question, context=context_text)},
+                ],
+                temperature=0.1,
+                response_format={"type": "json_object"},
+            )
+            data2 = json.loads(resp2.choices[0].message.content.strip())
+            if isinstance(data2.get("citations", []), list) and data2.get("citations"):
+                data = data2
+    except Exception:
+        pass
+
+
     return data
 
 # ───────────────────── Пост-процесс и рендер ────────────────────

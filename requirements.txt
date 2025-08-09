@@ -7,3 +7,5 @@ gspread>=6.0.0          # опционально, только если логи
 google-auth>=2.29.0     # опционально, нужно для gspread
 python-dotenv>=1.0.0    # опционально, если удобно грузить .env
 pymorphy2
+pymorphy2-dicts-ru
+
