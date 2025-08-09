@@ -112,7 +112,7 @@ GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip() 
 # Скоринговые веса
 W_EMB = 1.0
 W_BM25 = 0.75
-W_MAP = 0.50
+W_MAP = 1.25
 W_REGEX = 0.15
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
@@ -345,6 +345,17 @@ def rag_search(q: str, top_k_stage1: int = 120, final_k: int = 45) -> List[Dict[
     logger.debug("RAG selected idx: %s", top_idx[:15])
     return selected
 
+items.sort(key=lambda x: -x[1])
+top_idx = [i for i, _ in items[:final_k]]
+
+# ⬇️ форс-включаем явные попадания из mapped/regex
+for i in mapped_idx + regex_idx:
+    if i not in top_idx:
+        top_idx.append(i)
+top_idx = top_idx[:final_k]
+
+selected = [PUNKTS[i] for i in top_idx]
+
 # ───────────────────── Генерация ответа (LLM) ───────────────────
 
 SYSTEM_PROMPT = (
@@ -363,14 +374,17 @@ GEN_PROMPT_TEMPLATE = """\
 Требования к ответу (СТРОГО):
 1) Верни результат строго в JSON с полями:
    - short_answer: однострочный краткий вывод.
-   - reasoned_answer: развернутый официальный ответ по-деловому стилю.
-   - citations: список объектов вида {{"punkt_num": "N", "subpunkt_num": "M"|"" , "quote": "точная выдержка"}} — цитаты только из переданного контекста.
-   - related: список пунктов, которые важно дополнительно посмотреть, формат объектов {{"punkt_num": "N", "subpunkt_num": ""}}.
-2) Если в контексте нет прямого ответа — short_answer сформулируй как «В документе отсутствует информация, напрямую отвечающая на данный вопрос.»
-3) Не добавляй лишних полей. Формат JSON — без комментариев.
+   - reasoned_answer: 2–5 абзацев официального ответа по-деловому стилю с чёткими выводами по случаям.
+   - citations: список объектов вида {"punkt_num": "N", "subpunkt_num": "M"|"" , "quote": "точная выдержка"} — цитаты только из переданного контекста.
+   - related: список пунктов, которые важно дополнительно посмотреть, формат {"punkt_num": "N", "subpunkt_num": ""}.
+2) Если специальной нормы нет — дай вывод по общим нормам Правил (укажи соответствующие пункты) и явно отметь отсутствие отдельного освобождения.
+3) ОБЯЗАТЕЛЬНО приложи не менее 2 (двух) цитат в "citations". Цитаты выбирай из контекста.
+4) Не добавляй лишних полей. Формат JSON — без комментариев.
 """
 
-def build_context_snippets(punkts: List[Dict[str, Any]], max_chars: int = 8000) -> str:
+
+def build_context_snippets(punkts: List[Dict[str, Any]], max_chars: int = 12000) -> str:
+    
     """Собираем контекст: «п. X[.Y]: текст…»; ограничиваем размер для токенов."""
     parts: List[str] = []
     total = 0
@@ -423,26 +437,34 @@ def ask_llm(question: str, punkts: List[Dict[str, Any]]) -> Dict[str, Any]:
 # ───────────────────── Пост-процесс и рендер ────────────────────
 
 def validate_citations(citations: List[Dict[str, Any]], punkts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Оставляем только те цитаты, которые соответствуют переданным punkts (по punkt_num/subpunkt_num)."""
     allowed: set[Tuple[str, str]] = set(
         (str(p.get("punkt_num") or ""), str(p.get("subpunkt_num") or "")) for p in punkts
     )
+    # быстрый индекс по (pn, sp)
+    by_key = {(str(p.get("punkt_num") or ""), str(p.get("subpunkt_num") or "")): p for p in punkts}
+
     out: List[Dict[str, Any]] = []
     for c in citations:
         pn = str(c.get("punkt_num", ""))
         sp = str(c.get("subpunkt_num", ""))
-        qt = str(c.get("quote", "")).strip()
-        if (pn, sp) in allowed and qt:
-            out.append({"punkt_num": pn, "subpunkt_num": sp, "quote": qt})
-    # Дедуп по (pn, sp, quote)
-    seen = set()
-    uniq = []
+        qt = (c.get("quote") or "").strip()
+        if (pn, sp) in allowed:
+            if not qt:
+                base = (by_key[(pn, sp)].get("text") or "").strip()
+                if base:
+                    qt = base[:300] + ("…" if len(base) > 300 else "")
+            if qt:
+                out.append({"punkt_num": pn, "subpunkt_num": sp, "quote": qt})
+
+    # дедуп и ограничение
+    seen, uniq = set(), []
     for c in out:
         key = (c["punkt_num"], c["subpunkt_num"], c["quote"])
         if key not in seen:
-            uniq.append(c)
-            seen.add(key)
-    return uniq[:8]  # ограничим для компактности
+            seen.add(key); uniq.append(c)
+    # хотим как минимум 2 цитаты, но не более 8 (читаемо)
+    return uniq[:8]
+
 
 def render_html_answer(struct: Dict[str, Any], punkts: List[Dict[str, Any]]) -> str:
     sa = html.escape(struct.get("short_answer", "")).strip()
