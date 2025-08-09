@@ -127,14 +127,19 @@ W_REGEX = 0.15
 W_CAT = 1.1
 CAT_KEYS = ("исследовател", "модератор", "эксперт", "мастер")
 
+
 def kw_category_boost(question: str, doc_text: str) -> float:
     ql = (question or "").lower().replace("ё", "е")
     dl = (doc_text or "").lower().replace("ё", "е")
-    if any(key in ql for key in CAT_KEYS):
-        # принимаем дефис/тире/пробел
-        variants = ("педагог-","педагог —","педагог –","педагог ")
-        for k in CAT_KEYS:
-            if k in ql and any((v + k) in dl for v in variants):
+    if not any(k in ql for k in CAT_KEYS):
+        return 0.0
+    # принимаем дефис/длинное тире/среднее тире/пробел, и также просто наличие корня
+    variants = ("педагог-", "педагог —", "педагог –", "педагог ")
+    for k in CAT_KEYS:
+        if k in ql:
+            if k in dl:
+                return 1.0
+            if any((v + k) in dl for v in variants):
                 return 1.0
     return 0.0
 
@@ -383,39 +388,47 @@ def mapped_hits(q: str) -> List[int]:
 
 
 def rag_search(q: str, top_k_stage1: int = 120, final_k: int = 45) -> List[Dict[str, Any]]:
+    """
+    Гибридный retrieve: эмбеддинги + BM25 + маппинги/регэкспы + тематические бусты.
+    Плюс форс-добавление пунктов, где явно встречается запрошенная категория
+    (исследователь/модератор/эксперт/мастер), чтобы LLM мог процитировать их.
+    """
     q = normalize_query(q)
+    ql = q.lower().replace("ё", "е")
+
     variants = multi_query_rewrites(q)
     dense_agg: Dict[int, float] = {}
     sparse_agg: Dict[int, float] = {}
 
-    # Dense для каждого варианта
+    # Dense (эмбеддинги) для базового и вариантов
     for v in variants:
         for idx, sc in vector_search(v, top_k=top_k_stage1):
             dense_agg[idx] = max(dense_agg.get(idx, 0.0), sc)
 
-    # HyDE (опционально)
+    # HyDE (если включен)
     hyde = hyde_passage(q)
     if hyde:
         for idx, sc in vector_search(hyde, top_k=top_k_stage1 // 2):
             dense_agg[idx] = max(dense_agg.get(idx, 0.0), sc)
 
-    # Sparse для базового и вариантов
+    # Sparse (BM25/ключевые слова)
     for v in [q] + variants:
         for idx, sc in bm25_search(v, top_k=top_k_stage1):
             sparse_agg[idx] = max(sparse_agg.get(idx, 0.0), sc)
 
-    # Явные попадания
+    # Явные попадания (регэксп/маппинг)
     regex_idx = regex_hits(q)
     mapped_idx = mapped_hits(q)
 
-    # Нормировка sparse (z-score)
+    # Нормируем sparse (z-score), чтобы не «перебивал» эмбеддинги на длинных текстах
     if sparse_agg:
         vals = np.array(list(sparse_agg.values()), dtype=np.float64)
-        mu, sigma = float(vals.mean()), float(vals.std() + 1e-6)
+        mu = float(vals.mean())
+        sigma = float(vals.std() + 1e-6)
         for k in list(sparse_agg.keys()):
             sparse_agg[k] = (sparse_agg[k] - mu) / sigma
 
-    # Аггрегируем очки
+    # Сводный скор
     items: List[Tuple[int, float]] = []
     candidate_ids = set(list(dense_agg.keys()) + list(sparse_agg.keys()) + regex_idx + mapped_idx)
     for idx in candidate_ids:
@@ -423,27 +436,47 @@ def rag_search(q: str, top_k_stage1: int = 120, final_k: int = 45) -> List[Dict[
         sp_sc  = sparse_agg.get(idx, 0.0)
         rx_sc  = 1.0 if idx in regex_idx  else 0.0
         mp_sc  = 1.0 if idx in mapped_idx else 0.0
-        total  = W_EMB*emb_sc + W_BM25*sp_sc + W_REGEX*rx_sc + W_MAP*mp_sc
-        total += W_KW * kw_boost(q, PUNKTS[idx].get("text",""))
-        total += W_CAT * kw_category_boost(q, PUNKTS[idx].get("text", ""))
-        items.append((idx, total))
-       
 
-    # Сортировка и выбор top-K
+        total = (
+            W_EMB * emb_sc
+            + W_BM25 * sp_sc
+            + W_REGEX * rx_sc
+            + W_MAP * mp_sc
+        )
+        # тематические бусты (иностранное/исключения, конкретные категории)
+        txt = PUNKTS[idx].get("text", "")
+        total += W_KW  * kw_boost(q, txt)
+        total += W_CAT * kw_category_boost(q, txt)
+
+        items.append((idx, total))
+
+    # Сортировка и первичный top-K
     items.sort(key=lambda x: -x[1])
     top_idx = [i for i, _ in items[:final_k]]
 
-    # Форс-включаем явные совпадения из mapped/regex
+    # Форс-включение явных совпадений из mapped/regex
     for i in mapped_idx + regex_idx:
         if i not in top_idx:
             top_idx.append(i)
+
+    # ⬇️ Форс-включаем пункты, где явно встречается запрошенная категория
+    for k in CAT_KEYS:
+        if k in ql:
+            cat_ids = [
+                i for i, p in enumerate(PUNKTS)
+                if k in (p.get("text", "").lower().replace("ё", "е"))
+            ]
+            for i in cat_ids:
+                if i not in top_idx:
+                    top_idx.append(i)
+            break  # достаточно первой найденной категории
+
+    # Финальный обрез до K
     top_idx = top_idx[:final_k]
 
     selected = [PUNKTS[i] for i in top_idx]
     logger.debug("RAG selected idx: %s", top_idx[:15])
     return selected
-
-
 # ───────────────────── Генерация ответа (LLM) ───────────────────
 
 SYSTEM_PROMPT = (
@@ -460,11 +493,14 @@ GEN_PROMPT_TEMPLATE = """\
 {context}
 
 Требования к ответу (СТРОГО):
-1) Верни результат строго в JSON с полями:
-   - short_answer: ОДНА строка. Если в контексте есть потенциальные исключения → начни с "Зависит: ..." и кратко укажи условие ("если X — то без аттестации; иначе — по общим правилам"). Не давай безусловное "Да/Нет", когда в контексте есть исключения.
-   - reasoned_answer: 2–5 абзацев делового разбора: общая норма → специальные нормы/исключения → практические шаги.
-   - citations: список объектов вида {"punkt_num":"N","subpunkt_num":"M"|"" ,"quote":"точная выдержка"} — цитаты ТОЛЬКО из переданного контекста, минимум 2.
-   - related: список {"punkt_num":"N","subpunkt_num":""}.
+1) - short_answer: одна строка (≤200 символов). Правила:
+  • если в контексте есть исключения/льготы → начинай с "Зависит: …" и явно укажи условие ("если X — без аттестации; иначе — по общим правилам");
+  • если исключений нет → начинай с "По общим правилам: …";
+  • никогда не отвечай просто «Да/Нет»;
+  • не используй «обязан/обязательно/должен/необходимо», если среди цитат нет специальной нормы, подтверждающей обязанность, или среди цитат есть п.3/п.41;
+  • для вопросов про категории (модератор/эксперт/исследователь/мастер) — только итог «через аттестацию/без аттестации», без перечисления этапов;
+  • если прямой нормы в контексте нет — сформулируй: «Прямой нормы в контексте нет; ориентир — общие правила аттестации».
+
 2) Запрещено использовать пункты про периодичность/оплату/кол-во попыток как доказательство обязанности проходить аттестацию.
 3) Если вопрос про зарубежную магистратуру/иностранное образование и в контексте есть нормы об освобождении/присвоении без аттестации (например, выпускники NU, перечень "Болашақ") — ОБЯЗАТЕЛЬНО отрази это в short_answer ("Зависит: ...") и процитируй соответствующий пункт.
 4) Если вопрос про конкретную категорию (модератор/эксперт/исследователь/мастер) — в citations должна быть хотя бы одна цитата, где эта категория названа явно; в reasoned_answer перечисли этапы (заявление, документы/портфолио, критерии/баллы, сроки, решение комиссии).
@@ -492,33 +528,26 @@ def build_context_snippets(punkts: List[Dict[str, Any]], max_chars: int = 12000)
 def ask_llm(question: str, punkts: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Строит строгий JSON-ответ на основе фрагментов Правил.
-    Делает повторный ужесточённый запрос, если первичный ответ слабый/непо делу.
+    Делает повторный ужесточённый запрос, если первичный ответ слабый/не по делу.
     Требует: SYSTEM_PROMPT, GEN_PROMPT_TEMPLATE, build_context_snippets, call_with_retries, client, CHAT_MODEL, logger.
     """
 
     # ─────────────────── ВНУТРЕННИЕ ХЕЛПЕРЫ ───────────────────
 
     def _mentions_obligation(txt: str) -> bool:
-        """Есть ли формулировки «обязательно/обязан/должен/необходимо»."""
         t = (txt or "").lower()
         return bool(re.search(r"\b(обязан|обязательно|должен|необходимо)\b", t))
 
     def _citations_pts(citations: List[Dict[str, Any]]) -> set:
-        """Множество процитированных пунктов (по номеру пункта)."""
         return {str(c.get("punkt_num", "")).strip() for c in (citations or []) if str(c.get("punkt_num", "")).strip()}
 
     def _has_bad_proof_for_obligation(reasoned: str, citations: List[Dict[str, Any]]) -> bool:
-        """
-        Если в тексте явно заявлена обязанность, а среди цитат фигурируют п.3/п.41 (которые нельзя
-        использовать как «доказательство обязанности») — считаем это ошибкой.
-        """
         if not _mentions_obligation(reasoned):
             return False
         pts = _citations_pts(citations)
         return bool(pts & {"3", "41"})
 
     def _too_generic_citations(data: Dict[str, Any]) -> bool:
-        """Слишком мало уникальных цитат или пусто."""
         cites = data.get("citations") or []
         uniq = {(str(c.get("punkt_num", "")), str(c.get("subpunkt_num", ""))) for c in cites}
         return len([u for u in uniq if u[0]]) < 2
@@ -528,59 +557,43 @@ def ask_llm(question: str, punkts: List[Dict[str, Any]]) -> Dict[str, Any]:
         return any(k in t for k in ("магист", "за рубеж", "за границ", "зарубеж", "иностран", "болаш", "bolash", "nazarbayev university"))
 
     def _needs_reask_foreign(q: str, data: Dict[str, Any]) -> bool:
-        """
-        Для вопросов про зарубеж/магистратуру хотим увидеть специальную норму (например, п.32).
-        Если её нет среди цитат — просим пересобрать.
-        """
         if not _foreign_trigger(q):
             return False
         pts = _citations_pts(data.get("citations", []))
-        # Допускаем 32 как минимально ожидаемую «спец-норму».
-        return "32" not in pts
+        return "32" not in pts  # при необходимости скорректируй ожидаемую «спец-норму»
 
-    def _ctx_map(punkts: List[Dict[str, Any]]) -> Dict[Tuple[str, str], str]:
-        """Карта (пункт, подпункт) → текст фрагмента из выданного контекста."""
+    def _ctx_map(punkts_: List[Dict[str, Any]]) -> Dict[Tuple[str, str], str]:
         m = {}
-        for p in punkts:
+        for p in punkts_:
             pn = str(p.get("punkt_num", "")).strip()
             sp = str(p.get("subpunkt_num", "")).strip()
             m[(pn, sp)] = p.get("text", "") or ""
         return m
 
-    def _citations_contain_keyword(data: Dict[str, Any], ctx_lookup: Dict[Tuple[str, str], str], keyword: str) -> bool:
-        """Есть ли в процитированных фрагментах указанный keyword (например, «исследовател»)."""
-        for c in data.get("citations", []) or []:
+    def _citations_contain_keyword(data_: Dict[str, Any], ctx_lookup: Dict[Tuple[str, str], str], keyword: str) -> bool:
+        for c in data_.get("citations", []) or []:
             key = (str(c.get("punkt_num", "")).strip(), str(c.get("subpunkt_num", "")).strip())
             txt = ctx_lookup.get(key, "").lower()
             if keyword in txt:
                 return True
         return False
 
-    def _needs_reask_category(q: str, data: Dict[str, Any], punkts_ctx: List[Dict[str, Any]]) -> bool:
-        """
-        Если вопрос про конкретную категорию (например, «педагог-исследователь»), но:
-        - в контексте нет явных упоминаний этой категории, или
-        - среди процитированных фрагментов нет фрагмента с явным упоминанием,
-        - или цитаты слишком «общие»,
-        — просим пересобрать.
-        """
+    def _needs_reask_category(q: str, data_: Dict[str, Any], punkts_ctx: List[Dict[str, Any]]) -> bool:
         ql = (q or "").lower()
         if "исследовател" in ql:
             ctx_lookup = _ctx_map(punkts_ctx)
             has_in_ctx = any("исследовател" in (p.get("text", "").lower()) for p in punkts_ctx)
             if not has_in_ctx:
                 return True
-            if _too_generic_citations(data):
+            if _too_generic_citations(data_):
                 return True
-            if not _citations_contain_keyword(data, ctx_lookup, "исследовател"):
+            if not _citations_contain_keyword(data_, ctx_lookup, "исследовател"):
                 return True
         return False
 
-    def _build_user_prompt(template: str, question: str, context: str) -> str:
-        """
-        Надёжная подстановка без .format(), чтобы не словить KeyError из-за фигурных скобок в шаблоне.
-        """
-        return template.replace("{question}", question).replace("{context}", context)
+    def _build_user_prompt(template: str, q: str, context: str) -> str:
+        # Без .format() — безопасно к фигурным скобкам
+        return template.replace("{question}", q).replace("{context}", context)
 
     # ─────────────────── ПЕРВИЧНЫЙ ЗАПРОС ───────────────────
 
@@ -636,7 +649,7 @@ def ask_llm(question: str, punkts: List[Dict[str, Any]]) -> Dict[str, Any]:
         "2) НЕ используй п.3/п.41 как доказательство обязанности проходить аттестацию (их можно упоминать только как справочную информацию);\n"
         "3) Для вопросов про конкретную категорию (модератор/эксперт/исследователь/мастер) — процитируй фрагменты, где эта категория названа явно,\n"
         "   и кратко перечисли этапы: заявление, документы/портфолио, критерии/баллы, сроки, решение комиссии;\n"
-        "4) Если в контексте нет прямой специальной нормы — явно так и скажи и опирайся на общую норму, с точной ссылкой;"
+        "4) Если в контексте нет прямой специальной нормы — явно так и скажи и опирайся на общую норму, с точной ссылкой;\n"
         "5) Верни строго корректный JSON (без лишних полей), минимум две уникальные цитаты."
     )
     strict_prompt = _build_user_prompt(GEN_PROMPT_TEMPLATE + extra, question, context_text)
@@ -655,7 +668,6 @@ def ask_llm(question: str, punkts: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     try:
         data2 = json.loads(t2)
-        # Повторная валидация и проверка, что действительно стало лучше
         if (
             isinstance(data2.get("short_answer", ""), str)
             and isinstance(data2.get("reasoned_answer", ""), str)
@@ -672,38 +684,83 @@ def ask_llm(question: str, punkts: List[Dict[str, Any]]) -> Dict[str, Any]:
     return data
 
 
+def enforce_short_answer(question: str, data: dict, ctx_text: str) -> dict:
+    import re
+    sa = (data.get("short_answer") or "").strip()
+    cites = {str(c.get("punkt_num","")) for c in (data.get("citations") or [])}
+    ctx = (ctx_text or "").lower()
+
+    has_exception_signals = any(k in ctx for k in KW_EXCEPTION_TERMS)
+    starts_yes_no = bool(re.fullmatch(r"\s*(да|нет)[\.\!]*\s*", sa, flags=re.I))
+    has_bad_proof = ("3" in cites) or ("41" in cites)
+    uses_obligation = re.search(r"\b(обязан|обязательно|должен|необходимо)\b", sa.lower())
+
+    if has_exception_signals and not sa.lower().startswith("зависит:"):
+        sa = "Зависит: " + sa
+    if starts_yes_no:
+        sa = "По общим правилам: " + sa.capitalize()
+    if has_bad_proof and uses_obligation:
+        sa = re.sub(r"\b(обязан|обязательно|должен|необходимо)\b", "требуется по общим нормам", sa, flags=re.I)
+
+    data["short_answer"] = sa[:200]
+    return data
+
+
 # ───────────────────── Пост-процесс и рендер ────────────────────
 
 def validate_citations(citations: List[Dict[str, Any]], punkts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    allowed_keys = {(str(p.get("punkt_num","")), str(p.get("subpunkt_num",""))) for p in punkts}
-    by_key = {(str(p.get("punkt_num","")), str(p.get("subpunkt_num",""))): (p.get("text") or "") for p in punkts}
+    """
+    Очищает и нормализует цитаты:
+    - оставляет только те, что есть в выданном контексте;
+    - полностью выкидывает «мусорные» пункты (напр., 3 и 41);
+    - если quote не найден дословно в тексте пункта — подставляет безопасную авто-выдержку;
+    - дедуп и ограничение до 8 элементов.
+    """
+    SKIP_AS_EVIDENCE = {"3", "41"}
+
+    allowed_keys: set[Tuple[str, str]] = {
+        (str(p.get("punkt_num", "")), str(p.get("subpunkt_num", ""))) for p in punkts
+    }
+    by_key: Dict[Tuple[str, str], str] = {
+        (str(p.get("punkt_num", "")), str(p.get("subpunkt_num", ""))): (p.get("text") or "")
+        for p in punkts
+    }
 
     out: List[Dict[str, Any]] = []
-    for c in citations or []:
-        pn = str(c.get("punkt_num",""))
-        sp = str(c.get("subpunkt_num",""))
+    for c in (citations or []):
+        pn = str(c.get("punkt_num", "")).strip()
+        sp = str(c.get("subpunkt_num", "")).strip()
+        if not pn:
+            continue
+
+        # выкидываем п.3/п.41 целиком
+        if pn in SKIP_AS_EVIDENCE:
+            continue
+
         if (pn, sp) not in allowed_keys:
             continue
 
-        base = (by_key[(pn, sp)] or "").strip()
-        qt = (c.get("quote") or "").strip()
+        base = (by_key.get((pn, sp), "") or "").strip()
+        if not base:
+            continue
 
-        # Принимаем только если quote реально входит в текст пункта (безопасно по регистру)
+        qt = (c.get("quote") or "").strip()
         if qt and qt.lower() in base.lower():
             good_quote = qt
         else:
-            # Авто-выдержка вместо «галлюцинации»
             good_quote = base[:300] + ("…" if len(base) > 300 else "")
 
-        if good_quote:
-            out.append({"punkt_num": pn, "subpunkt_num": sp, "quote": good_quote})
+        out.append({"punkt_num": pn, "subpunkt_num": sp, "quote": good_quote})
 
-    # дедуп и ограничение
-    seen, uniq = set(), []
+    # дедуп и лимит
+    seen: set[Tuple[str, str, str]] = set()
+    uniq: List[Dict[str, Any]] = []
     for c in out:
         key = (c["punkt_num"], c["subpunkt_num"], c["quote"])
         if key not in seen:
-            seen.add(key); uniq.append(c)
+            seen.add(key)
+            uniq.append(c)
+
     return uniq[:8]
 
 
@@ -913,8 +970,13 @@ async def handle_webhook(request: web.Request) -> web.Response:
         punkts = rag_search(text)
         data_struct = ask_llm(text, punkts)
 
+        # ДО рендера — подстрахуем short_answer по найденному контексту
+        context_text = build_context_snippets(punkts)
+        data_struct = enforce_short_answer(text, data_struct, context_text)
+
         short_html = render_short_html(text, data_struct)
         detailed_html = render_detailed_html(text, data_struct, punkts)
+
 
         msg_id = tg_send_message(chat_id, short_html, reply_markup=kb_show_detailed())
         if msg_id:
