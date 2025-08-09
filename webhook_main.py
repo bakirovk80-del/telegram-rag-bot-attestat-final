@@ -590,7 +590,12 @@ def ask_llm(question: str, punkts: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     # ── Формируем контекст и первичный запрос к LLM
     context_text = build_context_snippets(punkts)
-    user_prompt = GEN_PROMPT_TEMPLATE.format(question=question, context=context_text)
+    user_prompt = (
+    GEN_PROMPT_TEMPLATE
+    .replace("{question}", question)
+    .replace("{context}", context_text)
+    )
+
 
     resp = call_with_retries(
         client.chat.completions.create,
