@@ -130,10 +130,14 @@ CAT_KEYS = ("исследовател", "модератор", "эксперт", 
 def kw_category_boost(question: str, doc_text: str) -> float:
     ql = (question or "").lower().replace("ё", "е")
     dl = (doc_text or "").lower().replace("ё", "е")
-    for k in CAT_KEYS:
-        if k in ql and f"педагог-{k}" in dl:
-            return 1.0
+    if any(key in ql for key in CAT_KEYS):
+        # принимаем дефис/тире/пробел
+        variants = ("педагог-","педагог —","педагог –","педагог ")
+        for k in CAT_KEYS:
+            if k in ql and any((v + k) in dl for v in variants):
+                return 1.0
     return 0.0
+
 
 W_KW = 0.9  # вес сигнала по ключевым словам для тематических исключений/зарубеж
 KW_EXCEPTION_TERMS = (
@@ -484,118 +488,104 @@ def build_context_snippets(punkts: List[Dict[str, Any]], max_chars: int = 12000)
         parts.append(one)
         total += len(one) + 2
     return "\n\n".join(parts)
-def _needs_reask(question: str, data: Dict[str, Any]) -> bool:
-    ql = (question or "").lower().replace("ё", "е")
-    if not any(k in ql for k in ("магист", "за рубеж", "за границ", "зарубеж", "иностран")):
-        return False
-    cited = {str(c.get("punkt_num", "")) for c in data.get("citations", [])}
-    # если не процитированы спец-нормы — просим пересобрать
-    return ("5" not in cited) and ("32" not in cited)
-def _needs_reask_foreign(question: str, data: Dict[str, Any]) -> bool:
-    """Требовать пересборку, если вопрос про зарубеж/магистратуру,
-    а в цитатах нет спец-норм (здесь примеры: п.5/п.32 — подставь свои реальные номера при необходимости)."""
-    ql = (question or "").lower().replace("ё", "е")
-    if any(k in ql for k in ("магист", "за рубеж", "за границ", "зарубеж", "иностран")):
-        cited = {str(c.get("punkt_num", "")).strip() for c in data.get("citations", [])}
-        return ("5" not in cited) and ("32" not in cited)
-    return False
-
-
-def _needs_reask_category(question: str, data: Dict[str, Any]) -> bool:
-    """Требовать пересборку, если спрашивают про конкретную категорию,
-    а в цитатах нет явных упоминаний самой категории."""
-    ql = (question or "").lower().replace("ё", "е")
-    if any(k in ql for k in ("исследовател", "модератор", "эксперт", "мастер")):
-        # хотя бы одна цитата должна содержать упоминание категории (простая эвристика)
-        for c in data.get("citations", []):
-            qt = (c.get("quote", "") or "").lower()
-            if any(("педагог-" + k) in qt for k in ("исследовател", "модератор", "эксперт", "мастер")):
-                return False
-        return True
-    return False
-
-
-def _too_generic_citations(data: Dict[str, Any]) -> bool:
-    """Ответ опирается только на общие нормы (например, п.2/п.6) — это слабое доказательство."""
-    cited_nums = {str(c.get("punkt_num", "")).strip() for c in data.get("citations", [])}
-    # подстрой под свои реальные «общие» пункты при необходимости
-    return cited_nums != set() and cited_nums.issubset({"2", "6"})
-
 
 def ask_llm(question: str, punkts: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Строим строгий JSON-ответ на основе фрагментов Правил.
-    При необходимости — пересборка с ужесточающим уточнением запроса."""
-    # ── Вспомогательные эвристики (локально, чтобы не было NameError)
-    def _needs_reask_foreign(q: str, data: Dict[str, Any]) -> bool:
-        ql = (q or "").lower().replace("ё", "е")
-        foreign = any(k in ql for k in ("магист", "за рубеж", "за границ", "зарубеж", "иностран"))
-        if not foreign:
-            return False
-        cites = data.get("citations", []) or []
-        cited_nums = {str(c.get("punkt_num", "")) for c in cites}
-        quotes = " ".join([(c.get("quote") or "") for c in cites]).lower()
-        # Если ни спец-норм (п.5/п.32), ни ключевых фраз об освобождении — просим пересобрать
-        has_special = ("5" in cited_nums) or ("32" in cited_nums)
-        has_free_words = any(x in quotes for x in (
-            "без прохождения процедуры", "без прохождения аттестации", "присваивается без", "не подлежит аттестации"
-        ))
-        return not (has_special or has_free_words)
+    """
+    Строит строгий JSON-ответ на основе фрагментов Правил.
+    Делает повторный ужесточённый запрос, если первичный ответ слабый/непо делу.
+    Требует: SYSTEM_PROMPT, GEN_PROMPT_TEMPLATE, build_context_snippets, call_with_retries, client, CHAT_MODEL, logger.
+    """
 
-    def _needs_reask_category(q: str, data: Dict[str, Any]) -> bool:
-        ql = (q or "").lower().replace("ё", "е")
-        cats = {
-            "исследователь": ("исследоват",),
-            "эксперт": ("эксперт",),
-            "модератор": ("модератор",),
-            "мастер": ("мастер",),
-        }
-        hit = None
-        for cname, tokens in cats.items():
-            if any(t in ql for t in tokens):
-                hit = tokens
-                break
-        if not hit:
+    # ─────────────────── ВНУТРЕННИЕ ХЕЛПЕРЫ ───────────────────
+
+    def _mentions_obligation(txt: str) -> bool:
+        """Есть ли формулировки «обязательно/обязан/должен/необходимо»."""
+        t = (txt or "").lower()
+        return bool(re.search(r"\b(обязан|обязательно|должен|необходимо)\b", t))
+
+    def _citations_pts(citations: List[Dict[str, Any]]) -> set:
+        """Множество процитированных пунктов (по номеру пункта)."""
+        return {str(c.get("punkt_num", "")).strip() for c in (citations or []) if str(c.get("punkt_num", "")).strip()}
+
+    def _has_bad_proof_for_obligation(reasoned: str, citations: List[Dict[str, Any]]) -> bool:
+        """
+        Если в тексте явно заявлена обязанность, а среди цитат фигурируют п.3/п.41 (которые нельзя
+        использовать как «доказательство обязанности») — считаем это ошибкой.
+        """
+        if not _mentions_obligation(reasoned):
             return False
-        # Требуем, чтобы хотя бы в одной цитате явно встречалось слово категории
-        cites = data.get("citations", []) or []
-        quotes = " ".join([(c.get("quote") or "") for c in cites]).lower()
-        return not any(t in quotes for t in hit)
+        pts = _citations_pts(citations)
+        return bool(pts & {"3", "41"})
 
     def _too_generic_citations(data: Dict[str, Any]) -> bool:
-        cites = data.get("citations", []) or []
-        if len(cites) < 2:
-            return True
-        # Слишком общие ссылки: все на базовые определения и без спец-норм
-        nums = [str(c.get("punkt_num", "")) for c in cites]
-        only_generic = set(nums).issubset({"2", "6"})
-        has_special = any(n in {"5", "30", "32"} for n in nums)
-        short_quotes = any(len((c.get("quote") or "").strip()) < 10 for c in cites)
-        return (only_generic and not has_special) or short_quotes
+        """Слишком мало уникальных цитат или пусто."""
+        cites = data.get("citations") or []
+        uniq = {(str(c.get("punkt_num", "")), str(c.get("subpunkt_num", ""))) for c in cites}
+        return len([u for u in uniq if u[0]]) < 2
 
-    def _force_conditional_short_answer_if_needed(q: str, data: Dict[str, Any]) -> None:
-        """Если вопрос про зарубеж/магистратуру и цитаты намекают на 'без аттестации',
-        то short_answer делаем условным 'Зависит: ...'."""
-        ql = (q or "").lower().replace("ё", "е")
-        if not any(k in ql for k in ("магист", "за рубеж", "за границ", "зарубеж", "иностран")):
-            return
-        cites = data.get("citations", []) or []
-        blob = " ".join([(c.get("quote") or "") for c in cites]).lower()
-        if any(x in blob for x in ("без прохождения процедуры", "без прохождения аттестации", "присваивается без", "не подлежит аттестации")):
-            sa = (data.get("short_answer", "") or "").strip()
-            if sa and sa.lower().startswith(("да", "нет")) and "завис" not in sa.lower():
-                data["short_answer"] = (
-                    "Зависит: если вы подпадаете под специальную норму (напр., выпускник NU/перечня «Болашақ» — "
-                    "присвоение категории без аттестации), иначе — аттестация по общим правилам."
-                )
+    def _foreign_trigger(txt: str) -> bool:
+        t = (txt or "").lower()
+        return any(k in t for k in ("магист", "за рубеж", "за границ", "зарубеж", "иностран", "болаш", "bolash", "nazarbayev university"))
 
-    # ── Формируем контекст и первичный запрос к LLM
+    def _needs_reask_foreign(q: str, data: Dict[str, Any]) -> bool:
+        """
+        Для вопросов про зарубеж/магистратуру хотим увидеть специальную норму (например, п.32).
+        Если её нет среди цитат — просим пересобрать.
+        """
+        if not _foreign_trigger(q):
+            return False
+        pts = _citations_pts(data.get("citations", []))
+        # Допускаем 32 как минимально ожидаемую «спец-норму».
+        return "32" not in pts
+
+    def _ctx_map(punkts: List[Dict[str, Any]]) -> Dict[Tuple[str, str], str]:
+        """Карта (пункт, подпункт) → текст фрагмента из выданного контекста."""
+        m = {}
+        for p in punkts:
+            pn = str(p.get("punkt_num", "")).strip()
+            sp = str(p.get("subpunkt_num", "")).strip()
+            m[(pn, sp)] = p.get("text", "") or ""
+        return m
+
+    def _citations_contain_keyword(data: Dict[str, Any], ctx_lookup: Dict[Tuple[str, str], str], keyword: str) -> bool:
+        """Есть ли в процитированных фрагментах указанный keyword (например, «исследовател»)."""
+        for c in data.get("citations", []) or []:
+            key = (str(c.get("punkt_num", "")).strip(), str(c.get("subpunkt_num", "")).strip())
+            txt = ctx_lookup.get(key, "").lower()
+            if keyword in txt:
+                return True
+        return False
+
+    def _needs_reask_category(q: str, data: Dict[str, Any], punkts_ctx: List[Dict[str, Any]]) -> bool:
+        """
+        Если вопрос про конкретную категорию (например, «педагог-исследователь»), но:
+        - в контексте нет явных упоминаний этой категории, или
+        - среди процитированных фрагментов нет фрагмента с явным упоминанием,
+        - или цитаты слишком «общие»,
+        — просим пересобрать.
+        """
+        ql = (q or "").lower()
+        if "исследовател" in ql:
+            ctx_lookup = _ctx_map(punkts_ctx)
+            has_in_ctx = any("исследовател" in (p.get("text", "").lower()) for p in punkts_ctx)
+            if not has_in_ctx:
+                return True
+            if _too_generic_citations(data):
+                return True
+            if not _citations_contain_keyword(data, ctx_lookup, "исследовател"):
+                return True
+        return False
+
+    def _build_user_prompt(template: str, question: str, context: str) -> str:
+        """
+        Надёжная подстановка без .format(), чтобы не словить KeyError из-за фигурных скобок в шаблоне.
+        """
+        return template.replace("{question}", question).replace("{context}", context)
+
+    # ─────────────────── ПЕРВИЧНЫЙ ЗАПРОС ───────────────────
+
     context_text = build_context_snippets(punkts)
-    user_prompt = (
-    GEN_PROMPT_TEMPLATE
-    .replace("{question}", question)
-    .replace("{context}", context_text)
-    )
-
+    user_prompt = _build_user_prompt(GEN_PROMPT_TEMPLATE, question, context_text)
 
     resp = call_with_retries(
         client.chat.completions.create,
@@ -609,7 +599,8 @@ def ask_llm(question: str, punkts: List[Dict[str, Any]]) -> Dict[str, Any]:
     )
     text = (resp.choices[0].message.content or "").strip()
 
-    # ── Парсим и валидируем JSON
+    # ─────────────────── ПАРСИНГ + БАЗОВАЯ ВАЛИДАЦИЯ ───────────────────
+
     try:
         data = json.loads(text)
         assert isinstance(data.get("short_answer", ""), str)
@@ -625,44 +616,59 @@ def ask_llm(question: str, punkts: List[Dict[str, Any]]) -> Dict[str, Any]:
             "related": [],
         }
 
-    # ── Эвристики качества: нужно ли пересобрать ответ
+    # ─────────────────── ЭВРИСТИКИ: НУЖНА ЛИ ПЕРЕСБОРКА ───────────────────
+
     need_reask = (
         _needs_reask_foreign(question, data)
-        or _needs_reask_category(question, data)
+        or _needs_reask_category(question, data, punkts)
         or _too_generic_citations(data)
+        or _has_bad_proof_for_obligation(data.get("reasoned_answer", ""), data.get("citations", []))
     )
 
-    if need_reask:
-        extra = (
-            "\nВАЖНО: Пересобери ответ. Для «зарубеж/магистратура» процитируй спец-нормы (например, п.5 и/или п.32) из переданного контекста, "
-            "если они присутствуют; не опирайся на п.3/п.41 как на доказательство обязанности проходить аттестацию. "
-            "Если вопрос про конкретную категорию (модератор/эксперт/исследователь/мастер) — процитируй пункты, где эта категория названа явно, "
-            "и перечисли этапы (подача, документы/портфолио, критерии/баллы, сроки, решение комиссии)."
-        )
-        strict_prompt = GEN_PROMPT_TEMPLATE + extra
+    if not need_reask:
+        return data
 
-        try:
-            resp2 = call_with_retries(
-                client.chat.completions.create,
-                model=CHAT_MODEL,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": strict_prompt.format(question=question, context=context_text)},
-                ],
-                temperature=0.1,
-                response_format={"type": "json_object"},
-            )
-            t2 = (resp2.choices[0].message.content or "").strip()
-            data2 = json.loads(t2)
-            if isinstance(data2.get("citations", []), list) and data2.get("citations"):
-                data = data2
-        except Exception:
-            # если не вышло — остаёмся на первой версии
-            pass
+    # ─────────────────── СТРОГИЙ ПОВТОРНЫЙ ЗАПРОС ───────────────────
 
-    # ── Правим short_answer при наличии освобождений
-    _force_conditional_short_answer_if_needed(question, data)
+    extra = (
+        "\nВАЖНО: Пересобери ответ.\n"
+        "1) Для вопросов про зарубежную магистратуру процитируй специальные нормы (например, п.32) из ПЕРЕДАННОГО контекста;\n"
+        "2) НЕ используй п.3/п.41 как доказательство обязанности проходить аттестацию (их можно упоминать только как справочную информацию);\n"
+        "3) Для вопросов про конкретную категорию (модератор/эксперт/исследователь/мастер) — процитируй фрагменты, где эта категория названа явно,\n"
+        "   и кратко перечисли этапы: заявление, документы/портфолио, критерии/баллы, сроки, решение комиссии;\n"
+        "4) Если в контексте нет прямой специальной нормы — явно так и скажи и опирайся на общую норму, с точной ссылкой;"
+        "5) Верни строго корректный JSON (без лишних полей), минимум две уникальные цитаты."
+    )
+    strict_prompt = _build_user_prompt(GEN_PROMPT_TEMPLATE + extra, question, context_text)
 
+    resp2 = call_with_retries(
+        client.chat.completions.create,
+        model=CHAT_MODEL,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": strict_prompt},
+        ],
+        temperature=0.1,
+        response_format={"type": "json_object"},
+    )
+    t2 = (resp2.choices[0].message.content or "").strip()
+
+    try:
+        data2 = json.loads(t2)
+        # Повторная валидация и проверка, что действительно стало лучше
+        if (
+            isinstance(data2.get("short_answer", ""), str)
+            and isinstance(data2.get("reasoned_answer", ""), str)
+            and isinstance(data2.get("citations", []), list)
+            and isinstance(data2.get("related", []), list)
+            and not _too_generic_citations(data2)
+            and not _has_bad_proof_for_obligation(data2.get("reasoned_answer", ""), data2.get("citations", []))
+        ):
+            return data2
+    except Exception as e:
+        logger.warning("LLM JSON parse (strict) error: %s; raw: %s", e, t2[:500])
+
+    # Если пересборка не улучшила результат — возвращаем первичный валидный ответ
     return data
 
 
