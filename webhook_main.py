@@ -493,19 +493,20 @@ GEN_PROMPT_TEMPLATE = """\
 {context}
 
 Требования к ответу (СТРОГО):
-1) - short_answer: одна строка (≤200 символов). Правила:
-  • если в контексте есть исключения/льготы → начинай с "Зависит: …" и явно укажи условие ("если X — без аттестации; иначе — по общим правилам");
-  • если исключений нет → начинай с "По общим правилам: …";
-  • никогда не отвечай просто «Да/Нет»;
-  • не используй «обязан/обязательно/должен/необходимо», если среди цитат нет специальной нормы, подтверждающей обязанность, или среди цитат есть п.3/п.41;
-  • для вопросов про категории (модератор/эксперт/исследователь/мастер) — только итог «через аттестацию/без аттестации», без перечисления этапов;
-  • если прямой нормы в контексте нет — сформулируй: «Прямой нормы в контексте нет; ориентир — общие правила аттестации».
-
-2) Запрещено использовать пункты про периодичность/оплату/кол-во попыток как доказательство обязанности проходить аттестацию.
-3) Если вопрос про зарубежную магистратуру/иностранное образование и в контексте есть нормы об освобождении/присвоении без аттестации (например, выпускники NU, перечень "Болашақ") — ОБЯЗАТЕЛЬНО отрази это в short_answer ("Зависит: ...") и процитируй соответствующий пункт.
-4) Если вопрос про конкретную категорию (модератор/эксперт/исследователь/мастер) — в citations должна быть хотя бы одна цитата, где эта категория названа явно; в reasoned_answer перечисли этапы (заявление, документы/портфолио, критерии/баллы, сроки, решение комиссии).
-5) Не добавляй лишних полей. JSON — без комментариев.
+1) Верни результат строго в JSON с полями:
+   - short_answer: одна строка (≤200 символов).
+   - reasoned_answer: 2–5 абзацев делового разбора (общая норма → спец-нормы/исключения → практические шаги).
+   - citations: СПИСОК ОБЪЕКТОВ вида {"punkt_num":"N","subpunkt_num":"M"|"" ,"quote":"точная выдержка"}.
+     НЕЛЬЗЯ строкой. НЕЛЬЗЯ списком строк. Только список объектов. Мини-пример:
+     {"citations":[{"punkt_num":"32","subpunkt_num":"","quote":"…точная выдержка из контекста…"}]}
+   - related: СПИСОК объектов {"punkt_num":"N","subpunkt_num":""}. НЕЛЬЗЯ строкой.
+2) Цитаты берём ТОЛЬКО из переданного контекста, минимум 2. Если точную выдержку сложно выделить — процитируй краткий фрагмент из контекста.
+3) Запрещено использовать пункты про периодичность/оплату/кол-во попыток как доказательство обязанности проходить аттестацию.
+4) Если вопрос про зарубежную магистратуру/иностр. образование и в контексте есть нормы об освобождении (напр., выпускники NU, перечень "Болашақ") — отрази это в short_answer ("Зависит: …") и процитируй соответствующий пункт.
+5) Если вопрос про конкретную категорию (модератор/эксперт/исследователь/мастер) — в citations должна быть хотя бы одна цитата с явным упоминанием категории; в reasoned_answer перечисли этапы (заявление, портфолио/документы, критерии/баллы, сроки, решение комиссии).
+6) Строго соблюдай типы полей. JSON — без лишних полей, без комментариев.
 """
+
 
 
 def build_context_snippets(punkts: List[Dict[str, Any]], max_chars: int = 12000) -> str:
@@ -527,76 +528,119 @@ def build_context_snippets(punkts: List[Dict[str, Any]], max_chars: int = 12000)
 
 def ask_llm(question: str, punkts: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Строит строгий JSON-ответ на основе фрагментов Правил.
-    Делает повторный ужесточённый запрос, если первичный ответ слабый/не по делу.
-    Требует: SYSTEM_PROMPT, GEN_PROMPT_TEMPLATE, build_context_snippets, call_with_retries, client, CHAT_MODEL, logger.
+    Строит строгий JSON-ответ на основе фрагментов Правил, с пост-коэрсией схемы.
+    При слабом ответе — повторный ужесточённый запрос.
     """
 
-    # ─────────────────── ВНУТРЕННИЕ ХЕЛПЕРЫ ───────────────────
-
-    def _mentions_obligation(txt: str) -> bool:
-        t = (txt or "").lower()
-        return bool(re.search(r"\b(обязан|обязательно|должен|необходимо)\b", t))
-
-    def _citations_pts(citations: List[Dict[str, Any]]) -> set:
-        return {str(c.get("punkt_num", "")).strip() for c in (citations or []) if str(c.get("punkt_num", "")).strip()}
-
-    def _has_bad_proof_for_obligation(reasoned: str, citations: List[Dict[str, Any]]) -> bool:
-        if not _mentions_obligation(reasoned):
-            return False
-        pts = _citations_pts(citations)
-        return bool(pts & {"3", "41"})
-
-    def _too_generic_citations(data: Dict[str, Any]) -> bool:
-        cites = data.get("citations") or []
-        uniq = {(str(c.get("punkt_num", "")), str(c.get("subpunkt_num", ""))) for c in cites}
-        return len([u for u in uniq if u[0]]) < 2
-
-    def _foreign_trigger(txt: str) -> bool:
-        t = (txt or "").lower()
-        return any(k in t for k in ("магист", "за рубеж", "за границ", "зарубеж", "иностран", "болаш", "bolash", "nazarbayev university"))
-
-    def _needs_reask_foreign(q: str, data: Dict[str, Any]) -> bool:
-        if not _foreign_trigger(q):
-            return False
-        pts = _citations_pts(data.get("citations", []))
-        return "32" not in pts  # при необходимости скорректируй ожидаемую «спец-норму»
-
-    def _ctx_map(punkts_: List[Dict[str, Any]]) -> Dict[Tuple[str, str], str]:
-        m = {}
-        for p in punkts_:
-            pn = str(p.get("punkt_num", "")).strip()
-            sp = str(p.get("subpunkt_num", "")).strip()
-            m[(pn, sp)] = p.get("text", "") or ""
-        return m
-
-    def _citations_contain_keyword(data_: Dict[str, Any], ctx_lookup: Dict[Tuple[str, str], str], keyword: str) -> bool:
-        for c in data_.get("citations", []) or []:
-            key = (str(c.get("punkt_num", "")).strip(), str(c.get("subpunkt_num", "")).strip())
-            txt = ctx_lookup.get(key, "").lower()
-            if keyword in txt:
-                return True
-        return False
-
-    def _needs_reask_category(q: str, data_: Dict[str, Any], punkts_ctx: List[Dict[str, Any]]) -> bool:
-        ql = (q or "").lower()
-        if "исследовател" in ql:
-            ctx_lookup = _ctx_map(punkts_ctx)
-            has_in_ctx = any("исследовател" in (p.get("text", "").lower()) for p in punkts_ctx)
-            if not has_in_ctx:
-                return True
-            if _too_generic_citations(data_):
-                return True
-            if not _citations_contain_keyword(data_, ctx_lookup, "исследовател"):
-                return True
-        return False
+    # ───── helpers: схема/валидация ─────
 
     def _build_user_prompt(template: str, q: str, context: str) -> str:
-        # Без .format() — безопасно к фигурным скобкам
         return template.replace("{question}", q).replace("{context}", context)
 
-    # ─────────────────── ПЕРВИЧНЫЙ ЗАПРОС ───────────────────
+    def _allowed_keys_set(punkts_: List[Dict[str, Any]]) -> set[Tuple[str, str]]:
+        return {(str(p.get("punkt_num","")).strip(), str(p.get("subpunkt_num","")).strip()) for p in punkts_}
 
+    def _closest_key(pn: str, sp: str, allowed: set[Tuple[str,str]]) -> Optional[Tuple[str,str]]:
+        # точное совпадение
+        key = (pn, sp)
+        if key in allowed:
+            return key
+        # если подпункт не нашли — попробуем без подпункта
+        key2 = (pn, "")
+        if key2 in allowed:
+            return key2
+        return None
+
+    _ALLOWED = _allowed_keys_set(punkts)
+
+    _NUM_RE = re.compile(r"(\d{1,3})(?:\.(\d{1,3}))?")
+
+    def _extract_pairs_from_text(s: str) -> List[Tuple[str,str]]:
+        out = []
+        for m in _NUM_RE.finditer(s or ""):
+            pn = m.group(1) or ""
+            sp = m.group(2) or ""
+            if pn:
+                key = _closest_key(pn, sp, _ALLOWED)
+                if key:
+                    out.append(key)
+        # дедуп
+        seen, uniq = set(), []
+        for k in out:
+            if k not in seen:
+                seen.add(k); uniq.append(k)
+        return uniq
+
+    def _coerce_citations(raw: Any) -> List[Dict[str, str]]:
+        """
+        Приводим citations к списку объектов {punkt_num, subpunkt_num, quote}.
+        Допускаем вход: строка "п. 32", список строк, список словарей c любыми полями.
+        Цитаты-выдержки подставим позже в рендере (validate_citations), здесь можно оставить пустую строку.
+        """
+        res: List[Dict[str,str]] = []
+        if isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, dict):
+                    pn = str(item.get("punkt_num","")).strip()
+                    sp = str(item.get("subpunkt_num","")).strip()
+                    if not pn and isinstance(item.get("quote"), str):
+                        # попробуем выдернуть номер из quote
+                        pairs = _extract_pairs_from_text(item.get("quote",""))
+                        if pairs:
+                            pn, sp = pairs[0]
+                    if pn:
+                        key = _closest_key(pn, sp, _ALLOWED)
+                        if key:
+                            res.append({"punkt_num": key[0], "subpunkt_num": key[1], "quote": str(item.get("quote","")).strip()})
+                elif isinstance(item, str):
+                    for pn, sp in _extract_pairs_from_text(item):
+                        res.append({"punkt_num": pn, "subpunkt_num": sp, "quote": ""})
+        elif isinstance(raw, str):
+            for pn, sp in _extract_pairs_from_text(raw):
+                res.append({"punkt_num": pn, "subpunkt_num": sp, "quote": ""})
+        # дедуп по (pn,sp,quote)
+        seen, uniq = set(), []
+        for c in res:
+            key = (c["punkt_num"], c["subpunkt_num"], c["quote"])
+            if key not in seen:
+                seen.add(key); uniq.append(c)
+        return uniq
+
+    def _coerce_related(raw: Any) -> List[Dict[str,str]]:
+        res: List[Dict[str,str]] = []
+        if isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, dict):
+                    pn = str(item.get("punkt_num","")).strip()
+                    sp = str(item.get("subpunkt_num","")).strip()
+                    if pn:
+                        key = _closest_key(pn, sp, _ALLOWED)
+                        if key:
+                            res.append({"punkt_num": key[0], "subpunkt_num": key[1]})
+                elif isinstance(item, str):
+                    for pn, sp in _extract_pairs_from_text(item):
+                        res.append({"punkt_num": pn, "subpunkt_num": sp})
+        elif isinstance(raw, str):
+            for pn, sp in _extract_pairs_from_text(raw):
+                res.append({"punkt_num": pn, "subpunkt_num": sp})
+        # дедуп по (pn,sp)
+        seen, uniq = set(), []
+        for r in res:
+            key = (r["punkt_num"], r["subpunkt_num"])
+            if key not in seen:
+                seen.add(key); uniq.append(r)
+        return uniq
+
+    def _normalize_llm_json(d: Dict[str, Any]) -> Dict[str, Any]:
+        out = {
+            "short_answer": str(d.get("short_answer","")).strip(),
+            "reasoned_answer": str(d.get("reasoned_answer","")).strip(),
+            "citations": _coerce_citations(d.get("citations", [])),
+            "related": _coerce_related(d.get("related", [])),
+        }
+        return out
+
+    # ───── первичный запрос ─────
     context_text = build_context_snippets(punkts)
     user_prompt = _build_user_prompt(GEN_PROMPT_TEMPLATE, question, context_text)
 
@@ -610,18 +654,13 @@ def ask_llm(question: str, punkts: List[Dict[str, Any]]) -> Dict[str, Any]:
         temperature=0.2,
         response_format={"type": "json_object"},
     )
-    text = (resp.choices[0].message.content or "").strip()
+    raw_text = (resp.choices[0].message.content or "").strip()
 
-    # ─────────────────── ПАРСИНГ + БАЗОВАЯ ВАЛИДАЦИЯ ───────────────────
-
+    # ───── парсинг + коэрсия схемы ─────
     try:
-        data = json.loads(text)
-        assert isinstance(data.get("short_answer", ""), str)
-        assert isinstance(data.get("reasoned_answer", ""), str)
-        assert isinstance(data.get("citations", []), list)
-        assert isinstance(data.get("related", []), list)
+        data_raw = json.loads(raw_text)
     except Exception as e:
-        logger.warning("LLM JSON parse error: %s; raw: %s", e, text[:500])
+        logger.warning("LLM JSON decode error: %s; raw: %s", e, raw_text[:500])
         return {
             "short_answer": "Не удалось корректно сформировать структурированный ответ.",
             "reasoned_answer": "Попробуйте сформулировать вопрос иначе или уточните контекст.",
@@ -629,28 +668,54 @@ def ask_llm(question: str, punkts: List[Dict[str, Any]]) -> Dict[str, Any]:
             "related": [],
         }
 
-    # ─────────────────── ЭВРИСТИКИ: НУЖНА ЛИ ПЕРЕСБОРКА ───────────────────
+    data = _normalize_llm_json(data_raw)
 
-    need_reask = (
-        _needs_reask_foreign(question, data)
-        or _needs_reask_category(question, data, punkts)
-        or _too_generic_citations(data)
-        or _has_bad_proof_for_obligation(data.get("reasoned_answer", ""), data.get("citations", []))
-    )
+    # базовая проверка типов (после коэрсии)
+    if not isinstance(data["short_answer"], str) or not isinstance(data["reasoned_answer"], str) \
+       or not isinstance(data["citations"], list) or not isinstance(data["related"], list):
+        logger.warning("LLM schema still invalid after normalize; raw: %s", str(data_raw)[:500])
+        return {
+            "short_answer": "Не удалось корректно сформировать структурированный ответ.",
+            "reasoned_answer": "Попробуйте сформулировать вопрос иначе или уточните контекст.",
+            "citations": [],
+            "related": [],
+        }
+
+    # ───── эвристики: нужна ли пересборка ─────
+    def _mentions_obligation(txt: str) -> bool:
+        return bool(re.search(r"\b(обязан|обязательно|должен|необходимо)\b", (txt or "").lower()))
+    def _cit_pts(cits: List[Dict[str,str]]) -> set:
+        return {c.get("punkt_num","") for c in (cits or [])}
+
+    need_reask = False
+
+    # иностр. образование — хотим видеть спец-норму
+    ql = (question or "").lower()
+    if any(k in ql for k in ("магист", "за рубеж", "за границ", "зарубеж", "иностран", "болаш", "bolash", "nazarbayev university")):
+        if "32" not in _cit_pts(data["citations"]):
+            need_reask = True
+
+    # слишком мало уникальных цитат?
+    uniq_cits = {(c.get("punkt_num",""), c.get("subpunkt_num","")) for c in data["citations"]}
+    if len([u for u in uniq_cits if u[0]]) < 2:
+        need_reask = True
+
+    # «обязан/обязательно…», но среди цитат есть 3/41 — переспросим
+    if _mentions_obligation(data["reasoned_answer"]) and (_cit_pts(data["citations"]) & {"3","41"}):
+        need_reask = True
 
     if not need_reask:
         return data
 
-    # ─────────────────── СТРОГИЙ ПОВТОРНЫЙ ЗАПРОС ───────────────────
-
+    # ───── строгий повторный запрос ─────
     extra = (
         "\nВАЖНО: Пересобери ответ.\n"
         "1) Для вопросов про зарубежную магистратуру процитируй специальные нормы (например, п.32) из ПЕРЕДАННОГО контекста;\n"
         "2) НЕ используй п.3/п.41 как доказательство обязанности проходить аттестацию (их можно упоминать только как справочную информацию);\n"
         "3) Для вопросов про конкретную категорию (модератор/эксперт/исследователь/мастер) — процитируй фрагменты, где эта категория названа явно,\n"
         "   и кратко перечисли этапы: заявление, документы/портфолио, критерии/баллы, сроки, решение комиссии;\n"
-        "4) Если в контексте нет прямой специальной нормы — явно так и скажи и опирайся на общую норму, с точной ссылкой;\n"
-        "5) Верни строго корректный JSON (без лишних полей), минимум две уникальные цитаты."
+        "4) Сохраняй строгую схему: citations — СПИСОК ОБЪЕКТОВ {punkt_num, subpunkt_num, quote}; related — СПИСОК ОБЪЕКТОВ {punkt_num, subpunkt_num}.\n"
+        "5) Минимум две уникальные цитаты."
     )
     strict_prompt = _build_user_prompt(GEN_PROMPT_TEMPLATE + extra, question, context_text)
 
@@ -664,24 +729,29 @@ def ask_llm(question: str, punkts: List[Dict[str, Any]]) -> Dict[str, Any]:
         temperature=0.1,
         response_format={"type": "json_object"},
     )
-    t2 = (resp2.choices[0].message.content or "").strip()
+    raw_text2 = (resp2.choices[0].message.content or "").strip()
 
     try:
-        data2 = json.loads(t2)
-        if (
-            isinstance(data2.get("short_answer", ""), str)
-            and isinstance(data2.get("reasoned_answer", ""), str)
-            and isinstance(data2.get("citations", []), list)
-            and isinstance(data2.get("related", []), list)
-            and not _too_generic_citations(data2)
-            and not _has_bad_proof_for_obligation(data2.get("reasoned_answer", ""), data2.get("citations", []))
-        ):
+        data_raw2 = json.loads(raw_text2)
+        data2 = _normalize_llm_json(data_raw2)
+
+        uniq_cits2 = {(c.get("punkt_num",""), c.get("subpunkt_num","")) for c in data2["citations"]}
+        ok = (
+            isinstance(data2["short_answer"], str)
+            and isinstance(data2["reasoned_answer"], str)
+            and isinstance(data2["citations"], list)
+            and isinstance(data2["related"], list)
+            and len([u for u in uniq_cits2 if u[0]]) >= 2
+            and not (_mentions_obligation(data2["reasoned_answer"]) and (_cit_pts(data2["citations"]) & {"3","41"}))
+        )
+        if ok:
             return data2
     except Exception as e:
-        logger.warning("LLM JSON parse (strict) error: %s; raw: %s", e, t2[:500])
+        logger.warning("LLM JSON parse (strict) error: %s; raw: %s", e, raw_text2[:500])
 
-    # Если пересборка не улучшила результат — возвращаем первичный валидный ответ
+    # если пересборка не помогла — возвращаем первичный нормализованный
     return data
+
 
 
 def enforce_short_answer(question: str, data: dict, ctx_text: str) -> dict:
