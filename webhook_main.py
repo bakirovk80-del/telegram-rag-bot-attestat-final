@@ -43,7 +43,6 @@ from __future__ import annotations
 import os
 import json
 import time
-import math
 import html
 import uuid
 import logging
@@ -58,6 +57,12 @@ from aiohttp import web
 # OpenAI v1 style
 from openai import OpenAI
 from openai import APIStatusError, APIConnectionError, RateLimitError, APITimeoutError
+# Опционально: лемматизация RU
+try:
+    import pymorphy2  # type: ignore
+    _MORPH = pymorphy2.MorphAnalyzer()
+except Exception:
+    _MORPH = None
 
 # Опционально: BM25
 try:
@@ -104,7 +109,10 @@ PUNKTS_PATH = os.environ.get("PUNKTS_PATH", "pravila_detailed_tagged_autofix.jso
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "text-embedding-ada-002")
 CHAT_MODEL = os.environ.get("CHAT_MODEL", "gpt-4o-mini")
 
+
 MULTI_QUERY = os.environ.get("MULTI_QUERY", "0") == "1"
+HYDE = os.environ.get("HYDE", "0") == "1"  # ⬅️ добавить эту строку
+
 
 SHEET_ID = os.environ.get("SHEET_ID", "").strip() or None
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip() or None
@@ -124,6 +132,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("rag-bot")
+LAST_RESPONSES: Dict[Tuple[int, int], Dict[str, Any]] = {}
 
 # ─────────────────────── Клиенты и данные ───────────────────────
 
@@ -153,11 +162,26 @@ if EMBEDDING_MODEL == "text-embedding-ada-002":
     assert PUNKT_EMBS.shape[1] == 1536, "For ada-002 expected 1536 dims"
 logger.info("Loaded %d punkts; embeddings: %s", len(PUNKTS), PUNKT_EMBS.shape)
 
+def tokenize(text: str) -> List[str]:
+    return re.findall(r"[а-яёa-z0-9]+", (text or "").lower())
+
+def normalize_tokens(tokens: List[str]) -> List[str]:
+    if not _MORPH:
+        return tokens
+    out = []
+    for t in tokens:
+        try:
+            p = _MORPH.parse(t)
+            out.append(p[0].normal_form if p else t)
+        except Exception:
+            out.append(t)
+    return out
 # Тексты для BM25/keyword поиска
 DOCS_TOKENS: List[List[str]] = []
 for p in PUNKTS:
-    toks = re.findall(r"[а-яёa-z0-9]+", (p.get("text") or "").lower())
-    DOCS_TOKENS.append(toks)
+    toks = tokenize(p.get("text") or "")
+    DOCS_TOKENS.append(normalize_tokens(toks))
+
 
 BM25 = None
 if HAVE_BM25:
@@ -179,8 +203,8 @@ def normalize_query(q: str) -> str:
     q = q.replace("ё", "е")
     return q.strip()
 
-def tokenize(text: str) -> List[str]:
-    return re.findall(r"[а-яёa-z0-9]+", text.lower())
+
+
 
 def call_with_retries(fn, max_attempts=3, base_delay=1.0, *args, **kwargs):
     for attempt in range(1, max_attempts + 1):
@@ -236,10 +260,32 @@ def vector_search(q: str, top_k: int = 100) -> List[Tuple[int, float]]:
     idxs = np.argsort(-sims)[:top_k]
     return [(int(i), float(sims[i])) for i in idxs]
 
+def hyde_passage(question: str) -> Optional[str]:
+    if not HYDE:
+        return None
+    prompt = (
+        "Сформулируй краткий официальный ответ (5–7 предложений) на вопрос по Правилам, "
+        "без выдумки фактов, максимально общий. Это черновой конспект для поиска, не окончательный ответ.\n\n"
+        f"Вопрос: {question}"
+    )
+    try:
+        resp = call_with_retries(
+            client.chat.completions.create,
+            model=CHAT_MODEL,
+            messages=[
+                {"role": "system", "content": "Ты аккуратно формулируешь юридический конспект на русском."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+        )
+        return (resp.choices[0].message.content or "").strip()
+    except Exception:
+        return None
 # ───────────────────── Sparse/BM25 поиск ────────────────────────
 
 def bm25_search(q: str, top_k: int = 100) -> List[Tuple[int, float]]:
-    toks = tokenize(q)
+    toks = normalize_tokens(tokenize(q))
+    
     if BM25:
         scores = BM25.get_scores(toks)
         idxs = np.argsort(-scores)[:top_k]
@@ -292,12 +338,6 @@ def mapped_hits(q: str) -> List[int]:
 
 # ───────────────────────── Merge & Score ────────────────────────
 
-def merge_scores(*score_lists: List[Tuple[int, float]]) -> Dict[int, float]:
-    agg: Dict[int, float] = {}
-    for slist, w in score_lists:
-        for idx, sc in slist:
-            agg[idx] = agg.get(idx, 0.0) + w * sc
-    return agg
 
 def rag_search(q: str, top_k_stage1: int = 120, final_k: int = 45) -> List[Dict[str, Any]]:
     q = normalize_query(q)
@@ -310,6 +350,12 @@ def rag_search(q: str, top_k_stage1: int = 120, final_k: int = 45) -> List[Dict[
         for idx, sc in vector_search(v, top_k=top_k_stage1):
             dense_agg[idx] = max(dense_agg.get(idx, 0.0), sc)
 
+    # HyDE (опционально)
+    hyde = hyde_passage(q)
+    if hyde:
+        for idx, sc in vector_search(hyde, top_k=top_k_stage1 // 2):
+            dense_agg[idx] = max(dense_agg.get(idx, 0.0), sc)
+
     # Sparse для базового и вариантов
     for v in [q] + variants:
         for idx, sc in bm25_search(v, top_k=top_k_stage1):
@@ -319,7 +365,7 @@ def rag_search(q: str, top_k_stage1: int = 120, final_k: int = 45) -> List[Dict[
     regex_idx = regex_hits(q)
     mapped_idx = mapped_hits(q)
 
-    # Нормируем sparse (z-score)
+    # Нормировка sparse (z-score)
     if sparse_agg:
         vals = np.array(list(sparse_agg.values()), dtype=np.float64)
         mu, sigma = float(vals.mean()), float(vals.std() + 1e-6)
@@ -351,6 +397,7 @@ def rag_search(q: str, top_k_stage1: int = 120, final_k: int = 45) -> List[Dict[
     logger.debug("RAG selected idx: %s", top_idx[:15])
     return selected
 
+
 # ───────────────────── Генерация ответа (LLM) ───────────────────
 
 SYSTEM_PROMPT = (
@@ -369,13 +416,18 @@ GEN_PROMPT_TEMPLATE = """\
 Требования к ответу (СТРОГО):
 1) Верни результат строго в JSON с полями:
    - short_answer: однострочный краткий вывод.
-   - reasoned_answer: 2–5 абзацев официального ответа по-деловому стилю с чёткими выводами по случаям.
+   - reasoned_answer: 2–5 абзацев официального ответа по-деловому стилю с разбором общего случая и возможных исключений.
    - citations: список объектов вида {{\"punkt_num\": \"N\", \"subpunkt_num\": \"M\"|\"\" , \"quote\": \"точная выдержка\"}} — цитаты только из переданного контекста.
    - related: список пунктов, которые важно дополнительно посмотреть, формат {{\"punkt_num\": \"N\", \"subpunkt_num\": \"\"}}.
 2) Если специальной нормы нет — дай вывод по общим нормам Правил (укажи соответствующие пункты) и явно отметь отсутствие отдельного освобождения.
-3) ОБЯЗАТЕЛЬНО приложи не менее 2 (двух) цитат в "citations". Цитаты выбирай из контекста.
-4) Не добавляй лишних полей. Формат JSON — без комментариев.
+3) ОБЯЗАТЕЛЬНО приложи не менее 2 (двух) цитат в \"citations\". 
+4) Каждый тезис подтверждай цитатой из соответствующего раздела: 
+   - \"кто обязан проходить\" → пункт с перечнем лиц/условий (общая норма), 
+   - \"исключение/без аттестации\" → специальный пункт, 
+   - \"периодичность/оплата\" → не используйте как доказательство обязанности.
+5) Не добавляй лишних полей. Формат JSON — без комментариев.
 """
+
 
 
 
@@ -436,7 +488,6 @@ def validate_citations(citations: List[Dict[str, Any]], punkts: List[Dict[str, A
     allowed: set[Tuple[str, str]] = set(
         (str(p.get("punkt_num") or ""), str(p.get("subpunkt_num") or "")) for p in punkts
     )
-    # быстрый индекс по (pn, sp)
     by_key = {(str(p.get("punkt_num") or ""), str(p.get("subpunkt_num") or "")): p for p in punkts}
 
     out: List[Dict[str, Any]] = []
@@ -458,22 +509,86 @@ def validate_citations(citations: List[Dict[str, Any]], punkts: List[Dict[str, A
         key = (c["punkt_num"], c["subpunkt_num"], c["quote"])
         if key not in seen:
             seen.add(key); uniq.append(c)
-    # хотим как минимум 2 цитаты, но не более 8 (читаемо)
     return uniq[:8]
 
 
-def render_html_answer(struct: Dict[str, Any], punkts: List[Dict[str, Any]]) -> str:
-    sa = html.escape(struct.get("short_answer", "")).strip()
-    ra = html.escape(struct.get("reasoned_answer", "")).strip()
-    citations = validate_citations(struct.get("citations", []), punkts)
-    related = struct.get("related", [])
 
-    lines: List[str] = []
+def split_for_telegram(text: str, limit: int = 4000) -> List[str]:
+    parts: List[str] = []
+    buf: List[str] = []
+    cur = 0
+    for line in (text or "").split("\n"):
+        if cur + len(line) + 1 > limit:
+            parts.append("\n".join(buf))
+            buf = [line]
+            cur = len(line) + 1
+        else:
+            buf.append(line)
+            cur += len(line) + 1
+    if buf:
+        parts.append("\n".join(buf))
+    return parts
+
+# ────────────────────── Telegram I/O ────────────────────────────
+
+def tg_send_message(chat_id: int, text: str, parse_mode: str = "HTML", reply_markup: Optional[dict] = None) -> Optional[int]:
+    url = f"{TELEGRAM_API}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": parse_mode,
+        "disable_web_page_preview": True,
+        "reply_markup": reply_markup,
+    }
+    r = requests.post(url, json=payload, timeout=15)
+    if not r.ok:
+        logger.error("sendMessage failed: %s %s", r.status_code, r.text)
+        return None
+    try:
+        return r.json().get("result", {}).get("message_id")
+    except Exception:
+        return None
+
+def tg_edit_message_text(chat_id: int, message_id: int, text: str, parse_mode: str = "HTML", reply_markup: Optional[dict] = None) -> None:
+    url = f"{TELEGRAM_API}/editMessageText"
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": parse_mode,
+        "disable_web_page_preview": True,
+        "reply_markup": reply_markup,
+    }
+    r = requests.post(url, json=payload, timeout=15)
+    if not r.ok:
+        logger.error("editMessageText failed: %s %s", r.status_code, r.text)
+def kb_show_detailed():
+    return {"inline_keyboard": [[{"text": "Показать подробный ответ", "callback_data": "show_detailed"}]]}
+
+def kb_show_short():
+    return {"inline_keyboard": [[{"text": "Показать краткий ответ", "callback_data": "show_short"}]]}
+def render_short_html(question: str, data: Dict[str, Any]) -> str:
+    sa = html.escape(data.get("short_answer", "")).strip()
+    ra = html.escape(data.get("reasoned_answer", "")).strip()
+    lines = [f"<b>Вопрос:</b> {html.escape(question)}"]
     if sa:
         lines.append(f"<b>Краткий ответ:</b>\n{sa}")
+    # намёк, что есть подробности
     if ra:
-        lines.append(f"<b>Официальный ответ:</b>\n{ra}")
+        lines.append("<i>Нажмите кнопку ниже, чтобы увидеть подробное обоснование и цитаты.</i>")
+    return "\n".join(lines)
 
+def render_detailed_html(question: str, data: Dict[str, Any], punkts: List[Dict[str, Any]]) -> str:
+    sa = html.escape(data.get("short_answer", "")).strip()
+    ra = html.escape(data.get("reasoned_answer", "")).strip()
+    citations = validate_citations(data.get("citations", []), punkts)
+    related = data.get("related", [])
+    lines: List[str] = []
+    lines.append(f"<b>Вопрос:</b> {html.escape(question)}")
+    if sa:
+        lines.append(f"<b>Краткий вывод:</b>\n{sa}")
+    if ra:
+        lines.append(f"<b>Подробное обоснование:</b>\n{ra}")
     if citations:
         lines.append("<b>Цитаты из Правил:</b>")
         for c in citations:
@@ -482,12 +597,6 @@ def render_html_answer(struct: Dict[str, Any], punkts: List[Dict[str, Any]]) -> 
             head = f"п. {pn}{('.' + sp) if sp else ''}".strip()
             qt = html.escape(c.get("quote", ""))
             lines.append(f"— <i>{head}</i>: {qt}")
-
-    # Подбор «Связанных пунктов»: если LLM не дал — добавим заголовки из контекста
-    if not related:
-        rel_keys = list({(p.get('punkt_num'), p.get('subpunkt_num')) for p in punkts})
-        related = [{"punkt_num": str(a or ''), "subpunkt_num": str(b or '')} for a, b in rel_keys][:8]
-
     if related:
         lines.append("<b>Связанные пункты:</b>")
         for r in related[:12]:
@@ -495,50 +604,27 @@ def render_html_answer(struct: Dict[str, Any], punkts: List[Dict[str, Any]]) -> 
             sp = html.escape(str(r.get("subpunkt_num", "")))
             head = f"п. {pn}{('.' + sp) if sp else ''}".strip()
             lines.append(f"• {head}")
-
     return "\n".join(lines).strip()
 
-def split_for_telegram(text: str, limit: int = 4000) -> List[str]:
-    res: List[str] = []
-    buf = []
-    total = 0
-    for line in text.split("\n"):
-        if total + len(line) + 1 > limit:
-            res.append("\n".join(buf))
-            buf = [line]
-            total = len(line) + 1
-        else:
-            buf.append(line)
-            total += len(line) + 1
-    if buf:
-        res.append("\n".join(buf))
-    return res
-
-# ────────────────────── Telegram I/O ────────────────────────────
-
-def tg_send_message(chat_id: int, text: str, parse_mode: str = "HTML") -> None:
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": parse_mode,
-        "disable_web_page_preview": True,
-    }
-    r = requests.post(url, json=payload, timeout=15)
-    if not r.ok:
-        logger.error("sendMessage failed: %s %s", r.status_code, r.text)
 
 def tg_set_webhook(full_url: str, secret: Optional[str]) -> None:
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook"
     payload = {"url": full_url}
     if secret:
         payload["secret_token"] = secret
-    payload["allowed_updates"] = ["message"]
+    payload["allowed_updates"] = ["message", "callback_query"]
+
     r = requests.post(url, json=payload, timeout=15)
     if not r.ok:
         logger.error("setWebhook failed: %s %s", r.status_code, r.text)
     else:
         logger.info("Webhook set: %s", full_url)
+def tg_answer_callback_query(callback_query_id: str) -> None:
+    url = f"{TELEGRAM_API}/answerCallbackQuery"
+    payload = {"callback_query_id": callback_query_id}
+    r = requests.post(url, json=payload, timeout=15)
+    if not r.ok:
+        logger.error("answerCallbackQuery failed: %s %s", r.status_code, r.text)
 
 # ─────────────────── Google Sheets логирование ──────────────────
 
@@ -566,20 +652,53 @@ async def handle_health(request: web.Request) -> web.Response:
     return web.Response(text="ok")
 
 async def handle_webhook(request: web.Request) -> web.Response:
-    # Проверка секрета Telegram (если задан)
     if TELEGRAM_WEBHOOK_SECRET:
         recv_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
         if recv_secret != TELEGRAM_WEBHOOK_SECRET:
             return web.Response(status=403, text="forbidden")
 
     data = await request.json()
+
+    # 1) CallbackQuery (кнопки)
+    if "callback_query" in data:
+        cq = data["callback_query"]
+        chat_id = cq.get("message", {}).get("chat", {}).get("id")
+        message_id = cq.get("message", {}).get("message_id")
+        action = cq.get("data")
+        if not chat_id or not message_id:
+            return web.Response(text="ok")
+
+        key = (int(chat_id), int(message_id))
+        stash = LAST_RESPONSES.get(key)
+
+        tg_answer_callback_query(cq.get("id"))
+
+        if not stash:
+            tg_edit_message_text(chat_id, message_id, "Данные недоступны. Отправьте вопрос заново.")
+            return web.Response(text="ok")
+
+        if action == "show_detailed":
+            detailed = stash["detailed_html"]
+            if len(detailed) <= 4000:
+                tg_edit_message_text(chat_id, message_id, detailed, reply_markup=kb_show_short())
+            else:
+                notice = stash["short_html"] + "\n\n<i>Подробный ответ отправлен отдельными сообщениями ниже.</i>"
+                tg_edit_message_text(chat_id, message_id, notice, reply_markup=kb_show_short())
+                for chunk in split_for_telegram(detailed, 4000):
+                    tg_send_message(chat_id, chunk)
+        elif action == "show_short":
+            tg_edit_message_text(chat_id, message_id, stash["short_html"], reply_markup=kb_show_detailed())
+
+        return web.Response(text="ok")
+
+    # 2) Обычное сообщение
     message = data.get("message", {}) if isinstance(data, dict) else {}
     chat = message.get("chat", {})
     chat_id = chat.get("id")
     text = message.get("text", "") or ""
 
     if not chat_id:
-        return web.Response(text="no chat")
+        return web.Response(text="ok")
 
     if text.strip().startswith("/start"):
         tg_send_message(chat_id, "Здравствуйте! Задайте вопрос по Правилам аттестации педагогов — я отвечу с цитатами.")
@@ -589,16 +708,24 @@ async def handle_webhook(request: web.Request) -> web.Response:
         tg_send_message(chat_id, "Пожалуйста, пришлите текстовый вопрос.")
         return web.Response(text="ok")
 
-    # Основной пайплайн
     try:
         punkts = rag_search(text)
-        struct = ask_llm(text, punkts)
-        html_answer = render_html_answer(struct, punkts)
-        parts = split_for_telegram(html_answer)
-        for part in parts:
-            tg_send_message(chat_id, part)
-        log_to_sheet_safe(chat_id, text, struct.get("short_answer", ""))
-    except Exception as e:
+        data_struct = ask_llm(text, punkts)
+
+        short_html = render_short_html(text, data_struct)
+        detailed_html = render_detailed_html(text, data_struct, punkts)
+
+        msg_id = tg_send_message(chat_id, short_html, reply_markup=kb_show_detailed())
+        if msg_id:
+            key = (int(chat_id), int(msg_id))
+            LAST_RESPONSES[key] = {
+                "message_id": int(msg_id),
+                "short_html": short_html,
+                "detailed_html": detailed_html,
+            }
+
+        log_to_sheet_safe(chat_id, text, data_struct.get("short_answer", ""))
+    except Exception:
         logger.exception("Processing failed")
         tg_send_message(chat_id, "Произошла ошибка при обработке запроса. Попробуйте позже.")
 
