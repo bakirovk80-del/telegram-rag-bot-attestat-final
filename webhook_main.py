@@ -124,7 +124,7 @@ W_MAP = 1.25
 W_REGEX = 0.15
 
 # рядом с другими весами
-W_CAT = 1.6
+W_CAT = 1.8
 CAT_KEYS = ("исследовател", "модератор", "эксперт", "мастер")
 
 
@@ -984,6 +984,7 @@ def render_detailed_html(question: str, data: Dict[str, Any], punkts: List[Dict[
             head = f"п. {pn}{('.' + sp) if sp else ''}".strip()
             lines.append(f"• {head}")
     return "\n".join(lines).strip()
+
 
 
 def tg_set_webhook(full_url: str, secret: Optional[str]) -> None:
