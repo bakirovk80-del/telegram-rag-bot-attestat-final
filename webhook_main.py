@@ -56,7 +56,9 @@ from aiohttp import web
 
 # OpenAI v1 style
 from openai import OpenAI
-from openai import APIError, APIConnectionError, RateLimitError, APITimeoutError
+from openai import APIStatusError, APIConnectionError, RateLimitError, APITimeoutError
+
+
 # Опционально: лемматизация RU
 try:
     import pymorphy2  # type: ignore
@@ -274,7 +276,7 @@ def call_with_retries(fn, max_attempts=3, base_delay=1.0, *args, **kwargs):
     for attempt in range(1, max_attempts + 1):
         try:
             return fn(*args, **kwargs)
-        except (RateLimitError, APITimeoutError, APIConnectionError, APIError) as e:
+        except (RateLimitError, APITimeoutError, APIConnectionError, APIStatusError) as e:
             if attempt == max_attempts:
                 raise
             sleep_s = base_delay * (2 ** (attempt - 1)) + (0.1 * attempt)
@@ -488,13 +490,13 @@ def rag_search(q: str, top_k_stage1: int = 120, final_k: int = 45) -> List[Dict[
             must_have.extend(cat_ids)
             break  # достаточно первой найденной категории
 
+  
     # 2.3) если вопрос про зарубеж/магистратуру — форсим п.32
-    if any(k in ql for k in ("магист", "зарубеж", "за границ", "иностран", "болаш", "nazarbayev university")):
-        forced_32 = [
-            i for i, p in enumerate(PUNKTS)
-            if str(p.get("punkt_num", "")).strip() == "32"
-        ]
-        must_have.extend(forced_32)
+    foreign_q = any(k in ql for k in ("магист", "зарубеж", "за границ", "иностран", "болаш", "nazarbayev"))
+    if foreign_q:
+        forced_32 = [i for i, p in enumerate(PUNKTS) if str(p.get("punkt_num","")).strip() == "32"]
+        # ставим п.32 в самое начало must_have
+        must_have = forced_32 + must_have
 
     # 3) формируем итоговый список: сначала must_have, потом — по рейтингу; без дублей и с обрезкой до K
     top_idx: List[int] = []
@@ -524,21 +526,23 @@ GEN_PROMPT_TEMPLATE = """\
 
 Требования к ответу (СТРОГО):
 1) Верни СТРОГО корректный JSON с полями:
-   - short_answer: одна строка (≤200 символов).
-     Если в контексте есть исключение/льгота → начни с "Зависит: …; иначе — по общим правилам".
-   - reasoned_answer: 2–5 абзацев (общая норма → специальные нормы/исключения → практические шаги).
-   - citations: СПИСОК объектов {"punkt_num":"N","subpunkt_num":"M" или "","quote":"точная выдержка из контекста"}.
-     НЕЛЬЗЯ строкой. НЕЛЬЗЯ списком строк. Только список объектов (минимум 2, если в контексте они есть).
-   - related: СПИСОК объектов {"punkt_num":"N","subpunkt_num":"M" или ""} (может быть пустым []).
+   "short_answer": одна строка (≤200 символов). Форматируй так:
+     - если в контексте есть освобождение/льгота → "Зависит: если <условие>, то <итог>; иначе — по общим правилам".
+     - иначе → "По общим правилам: <итог>".
+   "reasoned_answer": 1–3 коротких абзаца (главная норма → спец-исключение → практический вывод). Без описания процедур, если их нет в цитатах.
+   "citations": СПИСОК объектов {"punkt_num":"N","subpunkt_num":"M" или "","quote":"точная выдержка из контекста"}.
+     Минимум 1–2 шт. Сначала ключевая норма по сути вопроса.
+   "related": СПИСОК объектов {"punkt_num":"N","subpunkt_num":"M" или ""} (может быть пустым []).
 
-2) Цитаты берём ТОЛЬКО из переданного контекста. Если сложно вычленить точную фразу — процитируй краткий фрагмент из контекста.
-3) НЕ упоминай периодичность/оплату/количество попыток вообще, если это не содержится в процитированных пунктах.
-4) Если вопрос про зарубежную магистратуру/иностр. образование и в контексте есть освобождение (напр., выпускники NU/перечень "Болашақ") —
-   отрази это в short_answer ("Зависит: …; иначе — по общим правилам") и процитируй соответствующий пункт.
-5) Если вопрос про конкретную категорию (модератор/эксперт/исследователь/мастер) — среди citations должна быть цитата, где эта категория названа явно;
-   в reasoned_answer перечисли этапы: заявление → портфолио/документы → критерии/баллы → сроки → решение комиссии.
+2) Цитаты берём ТОЛЬКО из переданного контекста. Если точную фразу трудно выделить — процитируй короткий фрагмент (≤180 знаков).
+3) НЕ упоминай периодичность/оплату/ОЗП/кол-во попыток и т.п., если ЭТО НЕ процитировано.
+4) Для вопросов про зарубежную магистратуру/иностр. образование, если в контексте есть освобождение (напр., п.32):
+   — отрази это в short_answer в формате "Зависит: …; иначе — по общим правилам" и процитируй норму как первую в "citations".
+5) Для вопросов про конкретную категорию (модератор/эксперт/исследователь/мастер) — среди "citations" должна быть цитата,
+   где категория названа явно.
 6) JSON — без лишних полей, без комментариев, кавычки только двойные.
 """
+
 
 
 
@@ -685,7 +689,7 @@ def ask_llm(question: str, punkts: List[Dict[str, Any]]) -> Dict[str, Any]:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ],
-        temperature=0.2,
+        temperature=0,
         response_format={"type": "json_object"},
     )
     raw_text = (resp.choices[0].message.content or "").strip()
@@ -786,7 +790,7 @@ def ask_llm(question: str, punkts: List[Dict[str, Any]]) -> Dict[str, Any]:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": strict_prompt},
         ],
-        temperature=0.1,
+        temperature=0,
         response_format={"type": "json_object"},
     )
     raw_text2 = (resp2.choices[0].message.content or "").strip()
@@ -818,34 +822,33 @@ def enforce_short_answer(question: str, data: dict, ctx_text: str) -> dict:
     import re
     sa = (data.get("short_answer") or "").strip()
     cites = {str(c.get("punkt_num","")) for c in (data.get("citations") or [])}
+    ql = (question or "").lower()
     ctx = (ctx_text or "").lower()
 
-    is_category_q = any(k in (question or "").lower() for k in ("исследовател", "модератор", "эксперт", "мастер"))
-    has_exception_signals = any(k in ctx for k in KW_EXCEPTION_TERMS)
+    foreign_trigger = any(t in ql for t in ("магист", "за рубеж", "зарубеж", "иностран", "болаш", "nazarbayev"))
+    is_category_q = any(k in ql for k in ("исследовател", "модератор", "эксперт", "мастер"))
 
-    starts_yes_no = bool(re.fullmatch(r"\s*(да|нет)[\.\!]*\s*", sa, flags=re.I))
-    has_bad_proof = ("3" in cites) or ("41" in cites)
-    uses_obligation = re.search(r"\b(обязан|обязательно|должен|необходимо)\b", sa.lower())
-
-    foreign_trigger = any(t in (question or "").lower() for t in ("магист", "за рубеж", "зарубеж", "иностран", "болаш"))
-    if has_exception_signals and foreign_trigger:
-        if not sa.lower().startswith("зависит:"):
-            sa = "Зависит: " + sa
+    # Если есть льгота (п.32 в цитатах) и вопрос про зарубеж — формируем строго по шаблону
+    if foreign_trigger and ("32" in cites or "без прохождения процедуры аттестации" in ctx):
+        sa = ("Зависит: если магистратура окончена в зарубежной организации из перечня «Болашақ», "
+              "категория «педагог-модератор» присваивается без аттестации; иначе — по общим правилам.")
     else:
+        # Категории — приводим к "По общим правилам"
         if is_category_q and not sa.lower().startswith(("по общим правилам:", "зависит:")):
             sa = "По общим правилам: " + sa
 
-    if starts_yes_no:
+    # Нормируем ответы вида "да/нет"
+    if re.fullmatch(r"\s*(да|нет)[\.\!]*\s*", sa, flags=re.I):
         sa = "По общим правилам: " + sa.capitalize()
-    if has_bad_proof and uses_obligation:
-        sa = re.sub(r"\b(обязан|обязательно|должен|необходимо)\b", "требуется по общим нормам", sa, flags=re.I)
 
-    # добавляем хвост ДО сохранения в data
-    if sa.lower().startswith("зависит:") and "иначе — по общим правилам" not in sa.lower():
-        sa = sa.rstrip(".") + "; иначе — по общим правилам"
+    # Убираем жёсткие формулировки обязательности, если они опираются на п.3/п.41
+    bad = {"3","41"}
+    if (cites & bad):
+        sa = re.sub(r"\b(обязан|обязательно|должен|необходимо)\b", "требуется по общим нормам", sa, flags=re.I)
 
     data["short_answer"] = sa[:200]
     return data
+
 
 
 
@@ -907,36 +910,68 @@ def validate_citations(citations: List[Dict[str, Any]], punkts: List[Dict[str, A
 
     return uniq[:8]
 # ── Фильтрация цитат по ключевым словам из вопроса ──
-def filter_citations_by_question(question: str,
-                                 citations: List[Dict[str, Any]],
-                                 punkts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def filter_citations_by_question(
+    question: str,
+    citations: List[Dict[str, Any]],
+    punkts: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """
+    Делает цитаты максимально релевантными вопросу.
+    — Для «зарубеж/магистратура/Болашак» поднимает п. 32 на первое место и ограничивает 1–2 цитатами.
+    — Для вопросов про конкретную категорию (исследователь/модератор/эксперт/мастер) оставляет пункты,
+      где категория названа явно (до 3 шт.).
+    — Пункты 3 и 41 как «доказательство» убираются (на случай, если пришли от LLM до валидации).
+    — В остальных случаях слегка ограничивает длину (до 3 шт.).
+    """
     ql = (question or "").lower().replace("ё", "е")
+    if not citations:
+        return citations
 
-    # Ключи из вопроса: иностранное/Болашақ и конкретные категории
-    keys: List[str] = []
-    if any(k in ql for k in ("магист", "зарубеж", "за границ", "иностран", "болаш", "bolash", "nazarbayev university")):
-        keys.extend(["зарубеж", "болаш", "nazarbayev university", "без прохождения"])
-    for k in ("исследовател", "модератор", "эксперт", "мастер"):
-        if k in ql:
-            keys.append(k)
-
-    if not keys:
-        return citations  # ничего не фильтруем, если ключей нет
-
+    # Текст по ключу пункта → для проверки релевантности
     by_key = {
-        (str(p.get("punkt_num","")), str(p.get("subpunkt_num",""))): (p.get("text") or "").lower().replace("ё", "е")
+        (str(p.get("punkt_num", "")), str(p.get("subpunkt_num", ""))):
+            (p.get("text") or "").lower().replace("ё", "е")
         for p in punkts
     }
 
-    out: List[Dict[str, Any]] = []
-    for c in citations or []:
-        k = (str(c.get("punkt_num","")), str(c.get("subpunkt_num","")))
-        txt = by_key.get(k, "")
-        if any(key in txt for key in keys):
-            out.append(c)
+    # Базовая очистка: убираем 3/41 на всякий случай (validate_citations уже делает это, но продублируем)
+    clean = [c for c in citations if str(c.get("punkt_num", "")) not in {"3", "41"}]
+    if not clean:
+        clean = citations[:]
 
-    # если всё выкинули — вернём исходные, чтобы не было пусто
-    return out or citations
+    # Триггеры
+    foreign = any(k in ql for k in ("магист", "зарубеж", "за границ", "иностран", "болаш", "bolash", "nazarbayev"))
+    category_keys = ("исследовател", "модератор", "эксперт", "мастер")
+    is_category_q = any(k in ql for k in category_keys)
+
+    # ── Случай «зарубеж/магистратура»: ставим п.32 первым и режем до 2 ──
+    if foreign:
+        p32 = [c for c in clean if str(c.get("punkt_num", "")).strip() == "32"]
+        rest = [c for c in clean if str(c.get("punkt_num", "")).strip() != "32"]
+
+        preferred_terms = ("зарубеж", "болаш", "nazarbayev", "без прохождения")
+        def _relevant_foreign(c: Dict[str, Any]) -> bool:
+            key = (str(c.get("punkt_num", "")), str(c.get("subpunkt_num", "")))
+            txt = by_key.get(key, "")
+            return any(t in txt for t in preferred_terms)
+
+        # Сначала релевантные фрагменты, затем всё остальное
+        rest_sorted = sorted(rest, key=lambda c: (not _relevant_foreign(c)))
+        ordered = p32 + rest_sorted
+        return (ordered[:2] or clean[:2])
+
+    # ── Случай «конкретная категория»: оставляем пункты, где категория названа явно ──
+    if is_category_q:
+        def _mentions_category(c: Dict[str, Any]) -> bool:
+            key = (str(c.get("punkt_num", "")), str(c.get("subpunkt_num", "")))
+            txt = by_key.get(key, "")
+            return any(k in txt for k in category_keys)
+
+        cat_cits = [c for c in clean if _mentions_category(c)]
+        return (cat_cits or clean)[:3]
+
+    # ── По умолчанию: компактно ──
+    return clean[:3]
 
 
 def split_for_telegram(text: str, limit: int = 4000) -> List[str]:
