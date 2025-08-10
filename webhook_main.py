@@ -56,7 +56,7 @@ from aiohttp import web
 
 # OpenAI v1 style
 from openai import OpenAI
-from openai import APIStatusError, APIConnectionError, RateLimitError, APITimeoutError
+from openai import APIError, APIConnectionError, RateLimitError, APITimeoutError
 # Опционально: лемматизация RU
 try:
     import pymorphy2  # type: ignore
@@ -155,6 +155,8 @@ KW_FOREIGN_TERMS = (
     "зарубеж", "за пределами республики казахстан", "за границ",
     "иностран", "nazarbayev university", "болаш",
 )
+KW_PERIOD_TERMS = ("каждые пять лет", "не реже одного раза в пять лет", "периодичност", "оплат", "стоимост", "количеств", "попыток")
+
 def kw_boost(question: str, doc_text: str) -> float:
     ql = (question or "").lower().replace("ё", "е")
     dl = (doc_text or "").lower().replace("ё", "е")
@@ -176,8 +178,13 @@ def kw_boost(question: str, doc_text: str) -> float:
         boost += 0.3
         if is_category_q:
             boost -= 0.6  # штраф для льгот, когда спрашивают про категорию
+    # Анти-шум: если вопрос про категорию или про зарубеж, а документ про периодичность/оплату — слегка штрафуем
+    if (is_category_q or foreign_q) and any(k in dl for k in KW_PERIOD_TERMS):
+        boost -= 0.4
 
     return boost
+
+   
 
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
@@ -267,7 +274,7 @@ def call_with_retries(fn, max_attempts=3, base_delay=1.0, *args, **kwargs):
     for attempt in range(1, max_attempts + 1):
         try:
             return fn(*args, **kwargs)
-        except (RateLimitError, APITimeoutError, APIConnectionError, APIStatusError) as e:
+        except (RateLimitError, APITimeoutError, APIConnectionError, APIError) as e:
             if attempt == max_attempts:
                 raise
             sleep_s = base_delay * (2 ** (attempt - 1)) + (0.1 * attempt)
@@ -282,7 +289,7 @@ def multi_query_rewrites(q: str, n: int = 3) -> List[str]:
     prompt = f"Переформулируй этот вопрос юридической/официальной формулировкой на русском, сохранив смысл. Дай {n} вариантов, по одному в строке, без нумерации и комментариев:\n\n{q}"
     resp = call_with_retries(
         client.chat.completions.create,
-        model="gpt-4o-mini",
+        model=CHAT_MODEL,  # вместо "gpt-4o-mini"
         messages=[
             {"role": "system", "content": "Ты помощник по правовым/официальным формулировкам на русском языке."},
             {"role": "user", "content": prompt},
@@ -458,30 +465,44 @@ def rag_search(q: str, top_k_stage1: int = 120, final_k: int = 45) -> List[Dict[
         total += W_CAT * kw_category_boost(q, txt)
 
         items.append((idx, total))
+    
 
-    # Сортировка и первичный top-K
+    # ── Приоритизация обязательных пунктов + Top-K ──
+    # 1) сортируем все кандидаты по убыванию суммарного скора
     items.sort(key=lambda x: -x[1])
-    top_idx = [i for i, _ in items[:final_k]]
+    ranked = [i for i, _ in items]
 
-    # Форс-включение явных совпадений из mapped/regex
-    for i in mapped_idx + regex_idx:
-        if i not in top_idx:
-            top_idx.append(i)
+    # 2) собираем "обязательные" пункты, которые должны попасть в итог
+    must_have: List[int] = []
 
-    # ⬇️ Форс-включаем пункты, где явно встречается запрошенная категория
+    # 2.1) явные совпадения из mapped/regex
+    must_have.extend(mapped_idx + regex_idx)  # порядок не критичен, дубли уберём ниже
+
+    # 2.2) если в вопросе явно упомянута категория — форсим все пункты, где она названа
     for k in CAT_KEYS:
         if k in ql:
             cat_ids = [
                 i for i, p in enumerate(PUNKTS)
                 if k in (p.get("text", "").lower().replace("ё", "е"))
             ]
-            for i in cat_ids:
-                if i not in top_idx:
-                    top_idx.append(i)
+            must_have.extend(cat_ids)
             break  # достаточно первой найденной категории
 
-    # Финальный обрез до K
-    top_idx = top_idx[:final_k]
+    # 2.3) если вопрос про зарубеж/магистратуру — форсим п.32
+    if any(k in ql for k in ("магист", "зарубеж", "за границ", "иностран", "болаш", "nazarbayev university")):
+        forced_32 = [
+            i for i, p in enumerate(PUNKTS)
+            if str(p.get("punkt_num", "")).strip() == "32"
+        ]
+        must_have.extend(forced_32)
+
+    # 3) формируем итоговый список: сначала must_have, потом — по рейтингу; без дублей и с обрезкой до K
+    top_idx: List[int] = []
+    for i in must_have + ranked:
+        if i not in top_idx:
+            top_idx.append(i)
+        if len(top_idx) >= final_k:
+            break
 
     selected = [PUNKTS[i] for i in top_idx]
     logger.debug("RAG selected idx: %s", top_idx[:15])
@@ -502,19 +523,23 @@ GEN_PROMPT_TEMPLATE = """\
 {context}
 
 Требования к ответу (СТРОГО):
-1) Верни результат строго в JSON с полями:
+1) Верни СТРОГО корректный JSON с полями:
    - short_answer: одна строка (≤200 символов).
-   - reasoned_answer: 2–5 абзацев делового разбора (общая норма → спец-нормы/исключения → практические шаги).
-   - citations: СПИСОК ОБЪЕКТОВ вида {"punkt_num":"N","subpunkt_num":"M"|"" ,"quote":"точная выдержка"}.
-     НЕЛЬЗЯ строкой. НЕЛЬЗЯ списком строк. Только список объектов. Мини-пример:
-     {"citations":[{"punkt_num":"32","subpunkt_num":"","quote":"…точная выдержка из контекста…"}]}
-   - related: СПИСОК объектов {"punkt_num":"N","subpunkt_num":""}. НЕЛЬЗЯ строкой.
-2) Цитаты берём ТОЛЬКО из переданного контекста, минимум 2. Если точную выдержку сложно выделить — процитируй краткий фрагмент из контекста.
-3) Запрещено использовать пункты про периодичность/оплату/кол-во попыток как доказательство обязанности проходить аттестацию.
-4) Если вопрос про зарубежную магистратуру/иностр. образование и в контексте есть нормы об освобождении (напр., выпускники NU, перечень "Болашақ") — отрази это в short_answer ("Зависит: …") и процитируй соответствующий пункт.
-5) Если вопрос про конкретную категорию (модератор/эксперт/исследователь/мастер) — в citations должна быть хотя бы одна цитата с явным упоминанием категории; в reasoned_answer перечисли этапы (заявление, портфолио/документы, критерии/баллы, сроки, решение комиссии).
-6) Строго соблюдай типы полей. JSON — без лишних полей, без комментариев.
+     Если в контексте есть исключение/льгота → начни с "Зависит: …; иначе — по общим правилам".
+   - reasoned_answer: 2–5 абзацев (общая норма → специальные нормы/исключения → практические шаги).
+   - citations: СПИСОК объектов {"punkt_num":"N","subpunkt_num":"M" или "","quote":"точная выдержка из контекста"}.
+     НЕЛЬЗЯ строкой. НЕЛЬЗЯ списком строк. Только список объектов (минимум 2, если в контексте они есть).
+   - related: СПИСОК объектов {"punkt_num":"N","subpunkt_num":"M" или ""} (может быть пустым []).
+
+2) Цитаты берём ТОЛЬКО из переданного контекста. Если сложно вычленить точную фразу — процитируй краткий фрагмент из контекста.
+3) НЕ упоминай периодичность/оплату/количество попыток вообще, если это не содержится в процитированных пунктах.
+4) Если вопрос про зарубежную магистратуру/иностр. образование и в контексте есть освобождение (напр., выпускники NU/перечень "Болашақ") —
+   отрази это в short_answer ("Зависит: …; иначе — по общим правилам") и процитируй соответствующий пункт.
+5) Если вопрос про конкретную категорию (модератор/эксперт/исследователь/мастер) — среди citations должна быть цитата, где эта категория названа явно;
+   в reasoned_answer перечисли этапы: заявление → портфолио/документы → критерии/баллы → сроки → решение комиссии.
+6) JSON — без лишних полей, без комментариев, кавычки только двойные.
 """
+
 
 
 
@@ -666,16 +691,42 @@ def ask_llm(question: str, punkts: List[Dict[str, Any]]) -> Dict[str, Any]:
     raw_text = (resp.choices[0].message.content or "").strip()
 
     # ───── парсинг + коэрсия схемы ─────
+
+    # ───── парсинг + коэрсия схемы ─────
     try:
         data_raw = json.loads(raw_text)
     except Exception as e:
-        logger.warning("LLM JSON decode error: %s; raw: %s", e, raw_text[:500])
-        return {
-            "short_answer": "Не удалось корректно сформировать структурированный ответ.",
-            "reasoned_answer": "Попробуйте сформулировать вопрос иначе или уточните контекст.",
-            "citations": [],
-            "related": [],
-        }
+        logger.warning("LLM JSON decode error: %s; trying strict reprompt. Raw: %s", e, raw_text[:500])
+        # жёсткий повторный запрос сразу, если JSON не распарсился
+        extra = (
+            "\nВАЖНО: Пересобери ответ строго по схеме. "
+            "citations — это СПИСОК ОБЪЕКТОВ {punkt_num, subpunkt_num, quote}; "
+            "related — СПИСОК ОБЪЕКТОВ {punkt_num, subpunkt_num}. "
+            "Минимум две уникальные цитаты из ПЕРЕДАННОГО контекста."
+        )
+        strict_prompt = _build_user_prompt(GEN_PROMPT_TEMPLATE + extra, question, context_text)
+        resp2 = call_with_retries(
+            client.chat.completions.create,
+            model=CHAT_MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": strict_prompt},
+            ],
+            temperature=0.1,
+            response_format={"type": "json_object"},
+        )
+        raw_text2 = (resp2.choices[0].message.content or "").strip()
+        try:
+            data_raw = json.loads(raw_text2)
+        except Exception as e2:
+            logger.warning("LLM JSON decode error (strict) too: %s; raw: %s", e2, raw_text2[:500])
+            return {
+                "short_answer": "Не удалось корректно сформировать структурированный ответ.",
+                "reasoned_answer": "Попробуйте сформулировать вопрос иначе или уточните контекст.",
+                "citations": [],
+                "related": [],
+            }
+
 
     data = _normalize_llm_json(data_raw)
 
@@ -776,13 +827,11 @@ def enforce_short_answer(question: str, data: dict, ctx_text: str) -> dict:
     has_bad_proof = ("3" in cites) or ("41" in cites)
     uses_obligation = re.search(r"\b(обязан|обязательно|должен|необходимо)\b", sa.lower())
 
-    # «Зависит:» ставим ТОЛЬКО если вопрос про иностранное/льготы
     foreign_trigger = any(t in (question or "").lower() for t in ("магист", "за рубеж", "зарубеж", "иностран", "болаш"))
     if has_exception_signals and foreign_trigger:
         if not sa.lower().startswith("зависит:"):
             sa = "Зависит: " + sa
     else:
-        # для категорий без явных условий — принудительно «По общим правилам:»
         if is_category_q and not sa.lower().startswith(("по общим правилам:", "зависит:")):
             sa = "По общим правилам: " + sa
 
@@ -791,8 +840,13 @@ def enforce_short_answer(question: str, data: dict, ctx_text: str) -> dict:
     if has_bad_proof and uses_obligation:
         sa = re.sub(r"\b(обязан|обязательно|должен|необходимо)\b", "требуется по общим нормам", sa, flags=re.I)
 
+    # добавляем хвост ДО сохранения в data
+    if sa.lower().startswith("зависит:") and "иначе — по общим правилам" not in sa.lower():
+        sa = sa.rstrip(".") + "; иначе — по общим правилам"
+
     data["short_answer"] = sa[:200]
     return data
+
 
 
 
@@ -1108,7 +1162,11 @@ async def handle_webhook(request: web.Request) -> web.Response:
                 "short_html": short_html,
                 "detailed_html": detailed_html,
             }
-
+        if len(LAST_RESPONSES) > 200:
+           # удаляем самый старый
+           FIRST = next(iter(LAST_RESPONSES))
+           if FIRST != key:
+               LAST_RESPONSES.pop(FIRST, None)
         log_to_sheet_safe(chat_id, text, data_struct.get("short_answer", ""))
     except Exception:
         logger.exception("Processing failed")
@@ -1119,29 +1177,26 @@ async def handle_webhook(request: web.Request) -> web.Response:
 # ─────────────────────────── main() ─────────────────────────────
 
 async def on_startup(app: web.Application):
-    full_url = f"{os.environ.get('WEBHOOK_URL', '').strip()}{os.environ.get('WEBHOOK_PATH', '/webhook')}"
+    full_url = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
     tg_set_webhook(full_url, TELEGRAM_WEBHOOK_SECRET)
-    logger.info("Service started on port %s", int(os.environ.get("PORT", "8080")))
+    logger.info("Service started on port %s", PORT)
 
 def main():
     app = web.Application()
 
-    # роуты
     app.router.add_get("/health", handle_health)
-    app.router.add_post(os.environ.get("WEBHOOK_PATH", "/webhook"), handle_webhook)
+    app.router.add_post(WEBHOOK_PATH, handle_webhook)
 
-    # ⬇️ ВОТ ЗДЕСЬ — «после роутов»
+    async def handle_root(request):
+        return web.Response(text="ok")
+    app.router.add_get("/", handle_root)
+
     app.on_startup.append(on_startup)
-
-    # (необязательно) чтобы / не давал 404:
-    # async def handle_root(request):
-    #     return web.Response(text="ok")
-    # app.router.add_get("/", handle_root)
 
     loop = asyncio.get_event_loop()
     runner = web.AppRunner(app)
     loop.run_until_complete(runner.setup())
-    site = web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", "8080")))
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
     loop.run_until_complete(site.start())
     try:
         loop.run_forever()
@@ -1149,6 +1204,7 @@ def main():
         pass
     finally:
         loop.run_until_complete(runner.cleanup())
+
 
 
 if __name__ == "__main__":
