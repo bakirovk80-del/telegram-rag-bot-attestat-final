@@ -1211,16 +1211,13 @@ def render_detailed_html(question: str, data: Dict[str, Any], punkts: List[Dict[
             related.append({"punkt_num": pn, "subpunkt_num": sp})
 
     if _exists("39"): _push("39","")
-    # возьмём любой подпункт 63.*
     for p in punkts:
         if str(p.get("punkt_num","")).strip()=="63":
             _push("63", str(p.get("subpunkt_num","")).strip())
             break
 
-    # подменяем related в data (чтобы кнопка «краткий/подробный» показывала одно и то же)
-    data["related"] = related
+    data["related"] = related  # синхронизируем
 
-    # Рендер
     lines: List[str] = []
     lines.append(f"<b>Вопрос:</b> {html.escape(question)}")
     if sa:
@@ -1233,9 +1230,9 @@ def render_detailed_html(question: str, data: Dict[str, Any], punkts: List[Dict[
             pn = c.get("punkt_num", "")
             sp = c.get("subpunkt_num", "")
             head = f"п. {pn}{('.' + sp) if sp else ''}".strip()
-            # сохраняем переносы строк в цитатах
-            qt = html.escape(c.get("quote", "")).replace("\n", "<br>")
-            lines.append(f"— <i>{head}</i>: {qt}")
+            # ВАЖНО: НИКАКИХ <br>. Telegram HTML их не понимает.
+            qt = html.escape(c.get("quote", ""))  # переносы строк оставляем как \n
+            lines.append(f"— <i>{head}</i>:\n{qt}")
     if related:
         lines.append("<b>Связанные пункты:</b>")
         for r in related[:12]:
@@ -1244,8 +1241,6 @@ def render_detailed_html(question: str, data: Dict[str, Any], punkts: List[Dict[
             head = f"п. {pn}{('.' + sp) if sp else ''}".strip()
             lines.append(f"• {head}")
     return "\n".join(lines).strip()
-
-
 
 def tg_set_webhook(full_url: str, secret: Optional[str]) -> None:
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook"
