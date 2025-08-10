@@ -125,24 +125,30 @@ W_BM25 = 0.75
 W_MAP = 1.25
 W_REGEX = 0.15
 
-# рядом с другими весами
-W_CAT = 1.8
+# категории (усиливаем вклад)
+W_CAT = 2.2
 CAT_KEYS = ("исследовател", "модератор", "эксперт", "мастер")
 
-# ── ДОБАВЬ ЭТО (рядом с другими весами/константами) ─────────────────────────
-
-# канонические подпункты для категорий (для форс-подмешивания в контекст)
+# канонические подпункты для категорий (п.5.x)
 CAT_CANON = {
-    "исследовател": ("5", "4"),  # п.5, подп.4 — педагог-исследователь
+    "исследовател": ("5", "4"),
     "модератор":    ("5", "1"),
     "эксперт":      ("5", "3"),
     "мастер":       ("5", "5"),
 }
 
-# сигналы на ОЗП/порог — чтобы п.39 легче попадал при вопросах про категории
-KW_OZP_TERMS = ("озп", "оценка знаний педагогов", "80 %", "80%", "порог", "тестирован")
+# синонимы/варианты упоминания категорий в вопросах
+CATEGORY_SYNONYMS = {
+    "исследовател": ("исследовател", "research", "зерттеуш", "pedagog-issled"),
+    "модератор":    ("модератор",),
+    "эксперт":      ("эксперт",),
+    "мастер":       ("мастер",),
+}
 
-# длина цитат (по умолчанию и для «длинных» перечней компетенций из п.5.x)
+# ключи, по которым считаем, что речь про ОЗП/порог (для п.39)
+KW_OZP_TERMS = ("озп", "оценка знаний педагогов", "порог", "тестирован", "80 %", "80%")
+
+# лимиты длины цитат
 QUOTE_WIDTH_DEFAULT = int(os.environ.get("QUOTE_WIDTH_DEFAULT", "180"))
 QUOTE_WIDTH_LONG    = int(os.environ.get("QUOTE_WIDTH_LONG", "600"))
 
@@ -438,35 +444,47 @@ def rag_search(q: str, top_k_stage1: int = 120, final_k: int = 45) -> List[Dict[
     q = normalize_query(q)
     ql = q.lower().replace("ё", "е")
 
+    # определим, есть ли вопрос про категорию (с учётом синонимов)
+    def _is_cat_q(ql_: str) -> Optional[str]:
+        for key, syns in CATEGORY_SYNONYMS.items():
+            if any(s in ql_ for s in syns):
+                return key
+        return None
+    cat_key = _is_cat_q(ql)
+    is_category_q = cat_key is not None
+
+    # для категорий снижаем финальный K — меньше шума
+    if is_category_q:
+        final_k = min(final_k, 30)
+
     variants = multi_query_rewrites(q)
     dense_agg: Dict[int, float] = {}
     sparse_agg: Dict[int, float] = {}
 
-    # Dense (эмбеддинги)
+    # Dense
     for v in variants:
         for idx, sc in vector_search(v, top_k=top_k_stage1):
             dense_agg[idx] = max(dense_agg.get(idx, 0.0), sc)
 
-    # HyDE (если включен)
+    # HyDE
     hyde = hyde_passage(q)
     if hyde:
         for idx, sc in vector_search(hyde, top_k=top_k_stage1 // 2):
             dense_agg[idx] = max(dense_agg.get(idx, 0.0), sc)
 
-    # Sparse (BM25/ключевые слова)
+    # Sparse
     for v in [q] + variants:
         for idx, sc in bm25_search(v, top_k=top_k_stage1):
             sparse_agg[idx] = max(sparse_agg.get(idx, 0.0), sc)
 
-    # Явные попадания (регэксп/маппинг)
+    # Regex/Mapping
     regex_idx = regex_hits(q)
     mapped_idx = mapped_hits(q)
 
-    # Нормировка sparse
+    # z-score нормализация sparse
     if sparse_agg:
         vals = np.array(list(sparse_agg.values()), dtype=np.float64)
-        mu = float(vals.mean())
-        sigma = float(vals.std() + 1e-6)
+        mu = float(vals.mean()); sigma = float(vals.std() + 1e-6)
         for k in list(sparse_agg.keys()):
             sparse_agg[k] = (sparse_agg[k] - mu) / sigma
 
@@ -474,60 +492,49 @@ def rag_search(q: str, top_k_stage1: int = 120, final_k: int = 45) -> List[Dict[
     items: List[Tuple[int, float]] = []
     candidate_ids = set(list(dense_agg.keys()) + list(sparse_agg.keys()) + regex_idx + mapped_idx)
     for idx in candidate_ids:
-        emb_sc = dense_agg.get(idx, 0.0)
-        sp_sc  = sparse_agg.get(idx, 0.0)
-        rx_sc  = 1.0 if idx in regex_idx  else 0.0
-        mp_sc  = 1.0 if idx in mapped_idx else 0.0
-
         txt = PUNKTS[idx].get("text", "")
         total = (
-            W_EMB * emb_sc
-            + W_BM25 * sp_sc
-            + W_REGEX * rx_sc
-            + W_MAP * mp_sc
+            W_EMB * dense_agg.get(idx, 0.0)
+            + W_BM25 * sparse_agg.get(idx, 0.0)
+            + W_REGEX * (1.0 if idx in regex_idx else 0.0)
+            + W_MAP * (1.0 if idx in mapped_idx else 0.0)
             + W_KW  * kw_boost(q, txt)
             + W_CAT * kw_category_boost(q, txt)
         )
         items.append((idx, total))
 
-    # ── Приоритизация обязательных пунктов + Top-K ──
     items.sort(key=lambda x: -x[1])
     ranked = [i for i, _ in items]
 
+    # must-have
     must_have: List[int] = []
     must_have.extend(mapped_idx + regex_idx)
 
-    # если в вопросе упомянута категория — форсим все пункты, где она названа
-    for k in CAT_KEYS:
-        if k in ql:
-            cat_ids = [
-                i for i, p in enumerate(PUNKTS)
-                if k in (p.get("text", "").lower().replace("ё", "е"))
-            ]
-            must_have.extend(cat_ids)
+    if is_category_q:
+        # все упоминания целевой категории
+        for i, p in enumerate(PUNKTS):
+            txt = (p.get("text") or "").lower().replace("ё", "е")
+            if cat_key and cat_key in txt:
+                must_have.append(i)
+        # канонический подпункт п.5.x — на самый верх
+        pn, sp = CAT_CANON.get(cat_key, ("", ""))
+        if pn:
+            canon_ids = [i for i, p in enumerate(PUNKTS)
+                         if str(p.get("punkt_num","")).strip()==pn
+                         and str(p.get("subpunkt_num","")).strip()==sp]
+            must_have = canon_ids + must_have
+        # процедура и порог
+        for wanted in ("10", "39"):
+            add = [i for i, p in enumerate(PUNKTS)
+                   if str(p.get("punkt_num","")).strip()==wanted]
+            must_have.extend(add)
 
-            # + форсим канонический подпункт из п.5.x (например, 5.4 для исследователя)
-            pn, sp = CAT_CANON.get(k, ("", ""))
-            if pn:
-                canon_ids = [i for i, p in enumerate(PUNKTS)
-                             if str(p.get("punkt_num","")).strip()==pn
-                             and str(p.get("subpunkt_num","")).strip()==sp]
-                must_have = canon_ids + must_have  # канон — в самое начало
+    # зарубеж/магистратура — п.32 вверх
+    if any(k in ql for k in ("магист", "зарубеж", "за границ", "иностран", "болаш", "nazarbayev")):
+        p32 = [i for i, p in enumerate(PUNKTS) if str(p.get("punkt_num","")).strip()=="32"]
+        must_have = p32 + must_have
 
-            # + форсим процедурные: п.10 (процедура) и п.39 (ОЗП/порог)
-            for wanted in ("10", "39"):
-                add = [i for i, p in enumerate(PUNKTS)
-                       if str(p.get("punkt_num","")).strip()==wanted]
-                must_have.extend(add)
-            break  # достаточно первой найденной категории
-
-    # зарубежная магистратура — форсим п.32 на самый верх
-    foreign_q = any(k in ql for k in ("магист", "зарубеж", "за границ", "иностран", "болаш", "nazarbayev", "nazarbayev university"))
-    if foreign_q:
-        forced_32 = [i for i, p in enumerate(PUNKTS) if str(p.get("punkt_num","")).strip() == "32"]
-        must_have = forced_32 + must_have
-
-    # формируем итог без дублей
+    # итог без дублей
     top_idx: List[int] = []
     for i in must_have + ranked:
         if i not in top_idx:
@@ -535,9 +542,7 @@ def rag_search(q: str, top_k_stage1: int = 120, final_k: int = 45) -> List[Dict[
         if len(top_idx) >= final_k:
             break
 
-    selected = [PUNKTS[i] for i in top_idx]
-    logger.debug("RAG selected idx: %s", top_idx[:15])
-    return selected
+    return [PUNKTS[i] for i in top_idx]
 # ───────────────────── Генерация ответа (LLM) ───────────────────
 
 SYSTEM_PROMPT = (
@@ -859,32 +864,39 @@ def enforce_short_answer(question: str, data: dict, ctx_text: str) -> dict:
     ql = (question or "").lower()
     ctx = (ctx_text or "").lower()
 
-    foreign_trigger = any(t in ql for t in ("магист", "за рубеж", "зарубеж", "иностран", "болаш", "nazarbayev"))
-    is_category_q = any(k in ql for k in ("исследовател", "модератор", "эксперт", "мастер"))
+    # детектор категории по синонимам
+    def _is_category_q(q: str) -> bool:
+        qn = q.replace("ё","е")
+        for _, syns in CATEGORY_SYNONYMS.items():
+            if any(s in qn for s in syns):
+                return True
+        return False
 
-    # Если есть льгота (п.32 в цитатах) и вопрос про зарубеж — формируем строго по шаблону
+    foreign_trigger = any(t in ql for t in ("магист", "за рубеж", "зарубеж", "иностран", "болаш", "nazarbayev"))
+    is_category_q = _is_category_q(ql)
+
+    # Если есть льгота (п.32 в цитатах) и вопрос про зарубеж — строгий шаблон
     if foreign_trigger and ("32" in cites or "без прохождения процедуры аттестации" in ctx):
         sa = ("Зависит: если магистратура окончена в зарубежной организации из перечня «Болашақ», "
               "категория «педагог-модератор» присваивается без аттестации; иначе — по общим правилам.")
     else:
-        # Категории — приводим к "По общим правилам"
         if is_category_q and not sa.lower().startswith(("по общим правилам:", "зависит:")):
             sa = "По общим правилам: " + sa
 
-    # Нормируем ответы вида "да/нет"
+    # Нормализуем односложные ответы
     if re.fullmatch(r"\s*(да|нет)[\.\!]*\s*", sa, flags=re.I):
         sa = "По общим правилам: " + sa.capitalize()
 
-    # Убираем жёсткие формулировки обязательности, если они опираются на п.3/п.41
+    # Убираем жёсткие «обязан/обязательно», если в цитатах есть 3/41
     bad = {"3","41"}
     if (cites & bad):
         sa = re.sub(r"\b(обязан|обязательно|должен|необходимо)\b", "требуется по общим нормам", sa, flags=re.I)
-    # Если это вопрос про категорию и среди цитат есть п.10 (про процедуру) — добавим компактные этапы
+
+    # Если вопрос про категорию и среди цитат есть п.10 — добавим этапы (если влезают в лимит)
     if is_category_q and "10" in cites and "→" not in sa:
         tail = " (этапы: заявление → портфолио → ОЗП → обобщение → решение комиссии)"
         if len(sa) + len(tail) <= 200:
             sa += tail
-
 
     data["short_answer"] = sa[:200]
     return data
@@ -895,77 +907,89 @@ def enforce_short_answer(question: str, data: dict, ctx_text: str) -> dict:
 
 # ───────────────────── Пост-процесс и рендер ────────────────────
 
+def _collapse_repeats(text: str) -> str:
+    """
+    Удаляет подряд идущие идентичные строки и сжимает длинные повторяющиеся фрагменты
+    (типичный шум: «Оценивание методов…»).
+    """
+    lines = [ln.strip() for ln in (text or "").splitlines()]
+    out = []
+    prev = None
+    for ln in lines:
+        if not ln:
+            continue
+        if ln == prev:
+            continue
+        out.append(ln); prev = ln
+    s = "\n".join(out)
+    # простая защита от многократных повторов фразы внутри одной строки
+    s = re.sub(r"(Оценивание методов[^\.]*\.)\s*(\1\s*)+", r"\1 ", s, flags=re.I)
+    return re.sub(r"[ \t]+", " ", s).strip()
+
 def validate_citations(citations: List[Dict[str, Any]], punkts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Нормализует цитаты:
     - оставляет только те, что реально есть в выданном контексте;
     - выкидывает п.3 и п.41 как «доказательство»;
-    - сохраняет переносы строк (чтобы списки компетенций из п.5.x не «схлопывались»);
+    - сохраняет переносы строк;
     - обрезает текст по лимиту (длиннее для п.5.x);
-    - дедуп и лимит до 8.
+    - удаляет повторы и «мусорные» дубликаты;
+    - лимит до 8.
     """
     SKIP_AS_EVIDENCE = {"3", "41"}
 
-    allowed_keys: set[Tuple[str, str]] = {
-        (str(p.get("punkt_num", "")), str(p.get("subpunkt_num", ""))) for p in punkts
-    }
-    by_key: Dict[Tuple[str, str], str] = {
-        (str(p.get("punkt_num", "")), str(p.get("subpunkt_num", ""))): (p.get("text") or "")
+    allowed_keys = {(str(p.get("punkt_num","")).strip(), str(p.get("subpunkt_num","")).strip()) for p in punkts}
+    by_key = {
+        (str(p.get("punkt_num","")).strip(), str(p.get("subpunkt_num","")).strip()): (p.get("text") or "")
         for p in punkts
     }
 
     out: List[Dict[str, Any]] = []
     for c in (citations or []):
-        pn = str(c.get("punkt_num", "")).strip()
-        sp = str(c.get("subpunkt_num", "")).strip()
-        if not pn:
-            continue
-        if pn in SKIP_AS_EVIDENCE:
-            continue
-        if (pn, sp) not in allowed_keys:
+        pn = str(c.get("punkt_num","")).strip()
+        sp = str(c.get("subpunkt_num","")).strip()
+        if not pn or pn in SKIP_AS_EVIDENCE or (pn, sp) not in allowed_keys:
             continue
 
-        base = (by_key.get((pn, sp), "") or "")
+        base = by_key.get((pn, sp), "")
         if not base.strip():
             continue
 
-        # сохраняем переносы, сжимаем только множественные пробелы
-        qt = (c.get("quote") or "")
-        base_spaces = re.sub(r"[ \t]+", " ", base).strip()
-
-        # лимит для длинных списков из п.5.*
         limit = QUOTE_WIDTH_LONG if pn == "5" else QUOTE_WIDTH_DEFAULT
-
-        # если модель дала выдержку, и она реально встречается — берём её
+        qt = (c.get("quote") or "")
+        base_clean = _collapse_repeats(base)
         if qt and qt.lower().replace("ё","е") in base.lower().replace("ё","е"):
-            qt_spaces = re.sub(r"[ \t]+", " ", qt).strip()
-            good_quote = qt_spaces if len(qt_spaces) <= limit else (qt_spaces[:limit] + "…")
+            qt_clean = _collapse_repeats(qt)
+            good = qt_clean if len(qt_clean) <= limit else (qt_clean[:limit] + "…")
         else:
-            good_quote = base_spaces if len(base_spaces) <= limit else (base_spaces[:limit] + "…")
+            good = base_clean if len(base_clean) <= limit else (base_clean[:limit] + "…")
 
-        out.append({"punkt_num": pn, "subpunkt_num": sp, "quote": good_quote})
+        out.append({"punkt_num": pn, "subpunkt_num": sp, "quote": good})
 
-    # дедуп и лимит
-    seen: set[Tuple[str, str, str]] = set()
-    uniq: List[Dict[str, Any]] = []
+    # дедуп по (pn, sp, quote)
+    seen: set[Tuple[str,str,str]] = set(); uniq: List[Dict[str, Any]] = []
     for c in out:
         key = (c["punkt_num"], c["subpunkt_num"], c["quote"])
         if key not in seen:
-            seen.add(key)
-            uniq.append(c)
-
+            seen.add(key); uniq.append(c)
     return uniq[:8]
+
 
 def _ensure_category_citation(question: str,
                               citations: List[Dict[str, Any]],
                               punkts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     ql = (question or "").lower().replace("ё", "е")
-    cats = ("исследовател", "модератор", "эксперт", "мастер")
-    target_cat = next((c for c in cats if c in ql), None)
-    if not target_cat:
+
+    # ищем целевую категорию по синонимам
+    target = None
+    for key, syns in CATEGORY_SYNONYMS.items():
+        if any(s in ql for s in syns):
+            target = key
+            break
+    if not target:
         return citations
 
-    # если уже есть цитата с нужной категорией — ничего не делаем
+    # уже есть цитата с нужной категорией?
     by_key_txt = {
         (str(p.get("punkt_num","")).strip(), str(p.get("subpunkt_num","")).strip()):
             (p.get("text") or "").lower().replace("ё", "е")
@@ -973,18 +997,23 @@ def _ensure_category_citation(question: str,
     }
     def _mentions_cat(c: Dict[str, Any]) -> bool:
         key = (str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip())
-        return target_cat in by_key_txt.get(key, "")
+        return target in by_key_txt.get(key, "")
 
     if any(_mentions_cat(c) for c in (citations or [])):
         return citations
 
-    # иначе найдём подходящий пункт в контексте и добавим его первой цитатой
+    # если нет — добавляем канонический п.5.x первым, если он в контексте
+    pn, sp = CAT_CANON.get(target, ("", ""))
+    for p in punkts:
+        if str(p.get("punkt_num","")).strip()==pn and str(p.get("subpunkt_num","")).strip()==sp:
+            return [{"punkt_num": pn, "subpunkt_num": sp, "quote": ""}] + (citations or [])
+    # иначе — добавим первый пункт из контекста, где встречается корень категории
     for p in punkts:
         txt = (p.get("text") or "").lower().replace("ё", "е")
-        if target_cat in txt:
-            pn = str(p.get("punkt_num","")).strip()
-            sp = str(p.get("subpunkt_num","")).strip()
-            return [{"punkt_num": pn, "subpunkt_num": sp, "quote": ""}] + (citations or [])
+        if target in txt:
+            return [{"punkt_num": str(p.get("punkt_num","")).strip(),
+                     "subpunkt_num": str(p.get("subpunkt_num","")).strip(),
+                     "quote": ""}] + (citations or [])
     return citations
 
 # ── Фильтрация цитат по ключевым словам из вопроса ──
@@ -994,12 +1023,12 @@ def filter_citations_by_question(
     punkts: List[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
     """
-    Делает цитаты максимально релевантными вопросу + перекраивает quote на нужный фрагмент.
-    — «зарубеж/магистратура/Болашак»: п.32 первым, максимум 1–2 цитаты, quote вырезаем вокруг ключевых слов.
-    — «конкретная категория»: порядок — п.5.целевой → п.10 → п.39; оставляем до 3 цитат,
-       quote при необходимости вырезаем вокруг названия категории.
-    — Пункты 3 и 41 выкидываем как «доказательство».
-    — По умолчанию: до 3 цитат.
+    Релевантность и порядок:
+    — Зарубеж/магистратура: п.32 первым, максимум 1–2 цитаты.
+    — Категория: порядок — п.5.целевой → п.10 → п.39, до 3 цитат.
+      Если п.10/п.39 есть в контексте, но отсутствуют в цитатах — ДОБАВЛЯЕМ сюда.
+    — 3 и 41 выкидываем.
+    — Иначе: до 3 цитат.
     """
     import re
 
@@ -1007,20 +1036,13 @@ def filter_citations_by_question(
     if not citations:
         return citations
 
-    # Полные тексты пунктов по ключу
     by_key_full = {
-        (str(p.get("punkt_num", "")), str(p.get("subpunkt_num", ""))): (p.get("text") or "")
+        (str(p.get("punkt_num","")).strip(), str(p.get("subpunkt_num","")).strip()): (p.get("text") or "")
         for p in punkts
     }
-    # Нормализованные (для проверки вхождений)
-    by_key = {k: v.lower().replace("ё", "е") for k, v in by_key_full.items()}
+    by_key = {k: v.lower().replace("ё","е") for k, v in by_key_full.items()}
 
-    # Выкидываем 3/41
-    clean = [c for c in citations if str(c.get("punkt_num", "")) not in {"3", "41"}]
-    if not clean:
-        clean = citations[:]
-
-    # Хелпер: вырезать ~N-символьный отрывок вокруг первого попадания любой из ключевых фраз
+    # helper
     def _crop_around(text_full: str, keys: Tuple[str, ...], width: int = QUOTE_WIDTH_DEFAULT) -> str:
         tf = re.sub(r"[ \t]+", " ", text_full or "").strip()
         tl = tf.lower().replace("ё", "е")
@@ -1032,88 +1054,154 @@ def filter_citations_by_question(
         if pos == -1:
             return tf[:width] + ("…" if len(tf) > width else "")
         pad = width // 2
-        start = max(0, pos - pad)
-        end = min(len(tf), pos + pad)
-        while start > 0 and tf[start] not in " .,;:!?()[]{}«»":
-            start -= 1
-        while end < len(tf) and tf[end - 1] not in " .,;:!?()[]{}«»":
-            end += 1
+        start = max(0, pos - pad); end = min(len(tf), pos + pad)
+        while start > 0 and tf[start] not in " .,;:!?()[]{}«»": start -= 1
+        while end < len(tf) and tf[end - 1] not in " .,;:!?()[]{}«»": end += 1
         snippet = tf[start:end].strip()
         return snippet[:width] + ("…" if len(snippet) > width else "")
 
-    # Триггеры
-    foreign = any(k in ql for k in ("магист", "зарубеж", "за границ", "иностран", "болаш", "bolash", "nazarbayev"))
-    category_keys = ("исследовател", "модератор", "эксперт", "мастер")
-    is_category_q = any(k in ql for k in category_keys)
+    # remove 3/41
+    clean = [c for c in citations if str(c.get("punkt_num","")) not in {"3","41"}]
+    if not clean: clean = citations[:]
 
-    # ── Зарубежная магистратура: п.32 первым и максимум 1–2 цитаты
-    if foreign:
-        p32 = [c for c in clean if str(c.get("punkt_num", "")).strip() == "32"]
-        rest = [c for c in clean if str(c.get("punkt_num", "")).strip() != "32"]
-        pref_terms = ("зарубеж", "болаш", "nazarbayev", "без прохождения")
-        def _rel(c: Dict[str, Any]) -> bool:
-            key = (str(c.get("punkt_num","")), str(c.get("subpunkt_num","")))
-            return any(t in by_key.get(key, "") for t in pref_terms)
+    # foreign?
+    if any(k in ql for k in ("магист","зарубеж","за границ","иностран","болаш","bolash","nazarbayev")):
+        p32 = [c for c in clean if str(c.get("punkt_num","")).strip()=="32"]
+        rest = [c for c in clean if str(c.get("punkt_num","")).strip()!="32"]
+        pref_terms = ("зарубеж","болаш","nazarbayev","без прохождения")
+        def _rel(c): 
+            key = (str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip())
+            return any(t in by_key.get(key,"") for t in pref_terms)
         ordered = p32 + sorted(rest, key=lambda c: (not _rel(c)))
         out = (ordered[:2] or clean[:2])
-        # Перекраиваем quote на релевантное место
         for c in out:
-            key = (str(c.get("punkt_num","")), str(c.get("subpunkt_num","")))
+            key = (str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip())
             base_full = by_key_full.get(key, "")
             if base_full:
                 c["quote"] = _crop_around(base_full, pref_terms, width=QUOTE_WIDTH_DEFAULT)
         return out
 
-    # ── Конкретная категория: порядок п.5.целевой → п.10 → п.39, до 3 цитат
-    if is_category_q:
-        target = next((k for k in category_keys if k in ql), None)
+    # category?
+    target = None
+    for key, syns in CATEGORY_SYNONYMS.items():
+        if any(s in ql for s in syns):
+            target = key; break
 
-        def _mentions_target(c: Dict[str, Any]) -> bool:
-            key = (str(c.get("punkt_num", "")), str(c.get("subpunkt_num", "")))
-            txt = by_key.get(key, "")
-            return bool(target and target in txt)
+    if target:
+        # ensure p.10 and p.39 exist in context
+        def _exists_p(pn: str) -> Optional[Tuple[str,str,str]]:
+            for (kpn, ksp), t in by_key_full.items():
+                if kpn == pn:
+                    return (pn, ksp, t)
+            return None
 
-        # Сортировка по желаемому порядку
-        def key_of(c: Dict[str, Any]) -> Tuple[int, int]:
+        # sort: p.5.canon -> other p.5 -> 10 -> 39 -> rest
+        canon_sp = CAT_CANON.get(target, ("",""))[1]
+        def _ord(c):
             pn = str(c.get("punkt_num","")).strip()
             sp = str(c.get("subpunkt_num","")).strip()
-            # 0) точное п.5.целевой подпункт — самый верх (например, 5.4 для «исследовател»)
-            if pn == "5":
-                # приоритет точного подпункта из CAT_CANON
-                canon = CAT_CANON.get(target or "", ("", ""))[1]
-                if canon and sp == canon:
-                    return (0, 0)
-                # остальные подпункты п.5 — следом
-                return (1, 0)
-            # 2) п.10
-            if pn == "10": return (2, 0)
-            # 3) п.39
-            if pn == "39": return (3, 0)
-            # прочее
-            return (4, 0)
+            if pn=="5" and sp==canon_sp: return (0,0)
+            if pn=="5": return (1,0)
+            if pn=="10": return (2,0)
+            if pn=="39": return (3,0)
+            return (4,0)
 
-        clean.sort(key=key_of)
+        clean.sort(key=_ord)
         out = clean[:3]
 
-        # Перекраиваем quote вокруг целевой категории (если определена)
-        if target:
-            for c in out:
-                key = (str(c.get("punkt_num","")), str(c.get("subpunkt_num","")))
-                base_full = by_key_full.get(key, "")
-                if base_full:
-                    width = QUOTE_WIDTH_LONG if key[0] == "5" else QUOTE_WIDTH_DEFAULT
-                    c["quote"] = _crop_around(base_full, (target,), width=width)
-        return out
+        # if 10/39 missing but present in context — append them (with cropped quotes)
+        have = {(str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip()) for c in out}
+        for pn in ("10","39"):
+            if not any(c[0]==pn for c in have):
+                hit = _exists_p(pn)
+                if hit:
+                    pn_, sp_, txt_ = hit
+                    width = QUOTE_WIDTH_DEFAULT
+                    keys = ("заявлен", "портфолио", "озп", "обобщен") if pn=="10" else ("озп","порог","80")
+                    out.append({"punkt_num": pn_, "subpunkt_num": sp_, "quote": _crop_around(txt_, keys, width=width)})
 
-    # ── По умолчанию: до 3 и аккуратный срез, если quote пустой
+        # crop around category in p.5
+        for c in out:
+            key = (str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip())
+            base_full = by_key_full.get(key, "")
+            if base_full:
+                width = QUOTE_WIDTH_LONG if key[0]=="5" else QUOTE_WIDTH_DEFAULT
+                c["quote"] = _collapse_repeats(_crop_around(base_full, (target,), width=width))
+        return out[:3]
+
+    # default: просто до 3 и аккуратная нарезка если пусто
     out = clean[:3]
     for c in out:
         if not (c.get("quote") or "").strip():
-            key = (str(c.get("punkt_num", "")), str(c.get("subpunkt_num", "")))
+            key = (str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip())
             base_full = by_key_full.get(key, "")
             if base_full:
-                c["quote"] = _crop_around(base_full, tuple(), width=QUOTE_WIDTH_DEFAULT)
+                c["quote"] = _collapse_repeats(_crop_around(base_full, tuple(), width=QUOTE_WIDTH_DEFAULT))
     return out
+def enforce_reasoned_answer(question: str, data: Dict[str, Any], punkts: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Если вопрос про категорию и LLM дал «вату», заменяем/добавляем:
+    — короткий маркированный список (2–6 пунктов) компетенций из канонического п.5.x;
+    — затем одна строка про процедуру, если п.10 присутствует в цитатах/контексте.
+    """
+    ql = (question or "").lower().replace("ё", "е")
+
+    # определить категорию
+    target = None
+    for key, syns in CATEGORY_SYNONYMS.items():
+        if any(s in ql for s in syns):
+            target = key; break
+    if not target:
+        return data
+
+    # найти канонический п.5.x
+    pn, sp = CAT_CANON.get(target, ("",""))
+    base_txt = ""
+    for p in punkts:
+        if str(p.get("punkt_num","")).strip()==pn and str(p.get("subpunkt_num","")).strip()==sp:
+            base_txt = p.get("text","") or ""
+            break
+    if not base_txt:
+        return data
+
+    def _bullets_from(text: str, max_items: int = 6) -> List[str]:
+        t = _collapse_repeats(text)
+        # грубая, но устойчиво работает на перечнях компетенций
+        parts = re.split(r"(?:\n+|•|—|\u2014|;|\.\s+|\d+\)|\d+\.)", t)
+        parts = [re.sub(r"[ \t]+"," ", s).strip(" -—•.;") for s in parts]
+        parts = [s for s in parts if 20 <= len(s) <= 220]  # отсечь мусор/коротыши
+        uniq = []
+        seen = set()
+        for s in parts:
+            key = s.lower()[:80]
+            if key not in seen:
+                seen.add(key)
+                uniq.append(s)
+            if len(uniq) >= max_items:
+                break
+        return uniq[:max_items]
+
+    bullets = _bullets_from(base_txt)
+    if not bullets:
+        return data
+
+    # процедура есть?
+    cites = {(str(c.get("punkt_num","")).strip()) for c in (data.get("citations") or [])}
+    have_p10 = ("10" in cites) or any(str(p.get("punkt_num","")).strip()=="10" for p in punkts)
+
+    # собираем reasoned_answer
+    lines = [f"Ключевые компетенции («педагог-{target}», п.{pn}.{sp}):"]
+    lines += [f"— {b}" for b in bullets[:6]]
+    if have_p10:
+        lines.append("Процедура: заявление → портфолио → ОЗП → обобщение → решение комиссии (п.10).")
+
+    current = (data.get("reasoned_answer") or "").strip()
+    # если у модели уже был осмысленный список, не перетираем — только дополняем
+    if len(current) < 60 or "— " not in current:
+        data["reasoned_answer"] = "\n".join(lines)
+    else:
+        data["reasoned_answer"] = current + "\n\n" + "\n".join(lines)
+    return data
 
 def split_for_telegram(text: str, limit: int = 4000) -> List[str]:
     parts: List[str] = []
@@ -1351,11 +1439,22 @@ async def handle_webhook(request: web.Request) -> web.Response:
         context_text = build_context_snippets(punkts)
         data_struct = enforce_short_answer(text, data_struct, context_text)
 
+        # НОВОЕ: подправим reasoned_answer, если вопрос про категорию
+        data_struct = enforce_reasoned_answer(text, data_struct, punkts)
+
+        # HTML
         short_html = render_short_html(text, data_struct)
         detailed_html = render_detailed_html(text, data_struct, punkts)
 
+        # отправляем short; если длиннее лимита Telegram — разобьём
+        if len(short_html) <= 4000:
+            msg_id = tg_send_message(chat_id, short_html, reply_markup=kb_show_detailed())
+        else:
+            parts = split_for_telegram(short_html, 4000)
+            msg_id = tg_send_message(chat_id, parts[0], reply_markup=kb_show_detailed())
+            for extra in parts[1:]:
+                tg_send_message(chat_id, extra)
 
-        msg_id = tg_send_message(chat_id, short_html, reply_markup=kb_show_detailed())
         if msg_id:
             key = (int(chat_id), int(msg_id))
             LAST_RESPONSES[key] = {
@@ -1363,12 +1462,14 @@ async def handle_webhook(request: web.Request) -> web.Response:
                 "short_html": short_html,
                 "detailed_html": detailed_html,
             }
+
         if len(LAST_RESPONSES) > 200:
-           # удаляем самый старый
-           FIRST = next(iter(LAST_RESPONSES))
-           if FIRST != key:
-               LAST_RESPONSES.pop(FIRST, None)
+            FIRST = next(iter(LAST_RESPONSES))
+            if FIRST != key:
+                LAST_RESPONSES.pop(FIRST, None)
+
         log_to_sheet_safe(chat_id, text, data_struct.get("short_answer", ""))
+
     except Exception:
         logger.exception("Processing failed")
         tg_send_message(chat_id, "Произошла ошибка при обработке запроса. Попробуйте позже.")
