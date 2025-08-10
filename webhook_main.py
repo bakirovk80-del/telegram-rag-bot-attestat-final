@@ -960,7 +960,7 @@ def filter_citations_by_question(
     """
     Делает цитаты максимально релевантными вопросу + перекраивает quote на нужный фрагмент.
     — «зарубеж/магистратура/Болашак»: п.32 первым, максимум 1–2 цитаты, quote вырезаем вокруг ключевых слов.
-    — «конкретная категория»: оставляем пункты, где категория названа явно (до 3), quote вырезаем вокруг категории.
+    — «конкретная категория»: показываем только пункты с ИМЕННО этой категорией (до 3), quote вырезаем вокруг категории.
     — Пункты 3 и 41 выкидываем как «доказательство».
     — По умолчанию: до 3 цитат.
     """
@@ -974,11 +974,9 @@ def filter_citations_by_question(
         (str(p.get("punkt_num", "")), str(p.get("subpunkt_num", ""))): (p.get("text") or "")
         for p in punkts
     }
-    by_key = {
-        k: v.lower().replace("ё", "е") for k, v in by_key_full.items()
-    }
+    by_key = {k: v.lower().replace("ё", "е") for k, v in by_key_full.items()}
 
-    # На всякий случай выкинем 3/41 (validate_citations уже делает это)
+    # Базовая очистка (убираем 3/41)
     clean = [c for c in citations if str(c.get("punkt_num", "")) not in {"3", "41"}]
     if not clean:
         clean = citations[:]
@@ -994,23 +992,22 @@ def filter_citations_by_question(
                 pos = i
         if pos == -1:
             return tf[:width] + ("…" if len(tf) > width else "")
-        # центрируем окно около попадания
         pad = width // 2
         start = max(0, pos - pad)
         end = min(len(tf), pos + pad)
-        # обрезка по словам
         while start > 0 and tf[start] not in " .,;:!?()[]{}«»":
             start -= 1
-        while end < len(tf) and tf[end-1] not in " .,;:!?()[]{}«»":
+        while end < len(tf) and tf[end - 1] not in " .,;:!?()[]{}«»":
             end += 1
         snippet = tf[start:end].strip()
         return snippet[:width] + ("…" if len(snippet) > width else "")
 
-    # Если вопрос про «зарубеж/магистратуру»
+    # Триггеры
     foreign = any(k in ql for k in ("магист", "зарубеж", "за границ", "иностран", "болаш", "bolash", "nazarbayev"))
     category_keys = ("исследовател", "модератор", "эксперт", "мастер")
     is_category_q = any(k in ql for k in category_keys)
 
+    # ── «Зарубеж/магистратура» ──
     if foreign:
         p32 = [c for c in clean if str(c.get("punkt_num", "")).strip() == "32"]
         rest = [c for c in clean if str(c.get("punkt_num", "")).strip() != "32"]
@@ -1022,36 +1019,45 @@ def filter_citations_by_question(
 
         ordered = p32 + sorted(rest, key=lambda c: (not _rel(c)))
         out = (ordered[:2] or clean[:2])
-
-        # Перекраиваем quote на релевантное место
-        for c in out:
-            key = (str(c.get("punkt_num","")), str(c.get("subpunkt_num","")))
-            base_full = by_key_full.get(key, "")  # исходный текст пункта (без lower)
-            if base_full:
-                c["quote"] = _crop_around(base_full, pref_terms)
-        return out
-
-    if is_category_q:
-        def _mentions_category(c: Dict[str, Any]) -> bool:
-            key = (str(c.get("punkt_num","")), str(c.get("subpunkt_num","")))
-            return any(k in by_key.get(key, "") for k in category_keys)
-
-        cat_cits = [c for c in clean if _mentions_category(c)]
-        out = (cat_cits or clean)[:3]
-
-        # Выбираем ключ согласно вопросу (точнее таргетим)
-        target = next((k for k in category_keys if k in ql), None)
-        target_terms = (target,) if target else category_keys
-
-        # Перекраиваем quote так, чтобы в отрывок попала нужная категория
         for c in out:
             key = (str(c.get("punkt_num","")), str(c.get("subpunkt_num","")))
             base_full = by_key_full.get(key, "")
             if base_full:
-                c["quote"] = _crop_around(base_full, target_terms)
+                c["quote"] = _crop_around(base_full, pref_terms)
         return out
 
-    # По умолчанию — компактно до 3 и безопасный quote, если LLM дал пустой
+    # ── «Конкретная категория»: только ИМЕННО эта категория ──
+    if is_category_q:
+        target = next((k for k in category_keys if k in ql), None)
+
+        def _mentions_target(c: Dict[str, Any]) -> bool:
+            key = (str(c.get("punkt_num", "")), str(c.get("subpunkt_num", "")))
+            txt = by_key.get(key, "")
+            return bool(target and target in txt)
+
+        # 1) Фильтруем по целевой категории
+        cat_cits = [c for c in clean if _mentions_target(c)]
+
+        # 2) Fallback: если пусто — оставим те, где упомянута ЛЮБАЯ категория
+        if not cat_cits:
+            def _mentions_any(c: Dict[str, Any]) -> bool:
+                key = (str(c.get("punkt_num", "")), str(c.get("subpunkt_num", "")))
+                txt = by_key.get(key, "")
+                return any(k in txt for k in category_keys)
+            cat_cits = [c for c in clean if _mentions_any(c)]
+
+        out = cat_cits[:3] if cat_cits else clean[:3]
+
+        # 3) Перекраиваем quote ровно вокруг целевой категории (если определена)
+        if target:
+            for c in out:
+                key = (str(c.get("punkt_num","")), str(c.get("subpunkt_num","")))
+                base_full = by_key_full.get(key, "")
+                if base_full:
+                    c["quote"] = _crop_around(base_full, (target,))
+        return out
+
+    # ── По умолчанию ──
     out = clean[:3]
     for c in out:
         if not (c.get("quote") or "").strip():
@@ -1060,7 +1066,6 @@ def filter_citations_by_question(
             if base_full:
                 c["quote"] = _crop_around(base_full, tuple())
     return out
-
 
 def split_for_telegram(text: str, limit: int = 4000) -> List[str]:
     parts: List[str] = []
