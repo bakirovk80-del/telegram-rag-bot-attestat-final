@@ -48,11 +48,14 @@ import uuid
 import logging
 import asyncio
 import re
+import threading  # NEW
+
 from typing import List, Dict, Any, Tuple, Optional
 
 import numpy as np
 import requests
 from aiohttp import web
+from collections import OrderedDict  # NEW
 
 # OpenAI v1 style
 from openai import OpenAI
@@ -246,6 +249,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("rag-bot")
 LAST_RESPONSES: Dict[Tuple[int, int], Dict[str, Any]] = {}
+# --- неблокирующие обёртки для sync-функций ---
+async def run_blocking(fn, *args, **kwargs):
+    return await asyncio.to_thread(fn, *args, **kwargs)
+
+# --- пер-чатовая блокировка, чтобы не было параллельной обработки одного чата ---
+LOCKS: Dict[int, asyncio.Lock] = {}
 
 # ─────────────────────── Клиенты и данные ───────────────────────
 
@@ -358,7 +367,13 @@ def multi_query_rewrites(q: str, n: int = 3) -> List[str]:
 
 # ─────────────────────── Векторный поиск ────────────────────────
 
+def _topk_desc(arr: np.ndarray, k: int) -> np.ndarray:
+    k = max(1, min(k, arr.size))
+    idx = np.argpartition(-arr, k-1)[:k]
+    return idx[np.argsort(-arr[idx])]
+
 def embed_query(text: str) -> np.ndarray:
+    # Перенесено сюда, чтобы кэш (в блоке 4) работал — саму реализацию кэша см. ниже.
     resp = call_with_retries(
         client.embeddings.create,
         model=EMBEDDING_MODEL,
@@ -369,9 +384,31 @@ def embed_query(text: str) -> np.ndarray:
 
 def vector_search(q: str, top_k: int = 100) -> List[Tuple[int, float]]:
     vec = embed_query(q)
-    sims = cosine_sim(vec, PUNKT_EMBS)  # (N,)
-    idxs = np.argsort(-sims)[:top_k]
+    b = PUNKT_EMBS
+    a_norm = vec / (np.linalg.norm(vec) + 1e-12)
+    b_norm = b / (np.linalg.norm(b, axis=1, keepdims=True) + 1e-12)
+    sims = (b_norm @ a_norm)
+    idxs = _topk_desc(sims, top_k)
     return [(int(i), float(sims[i])) for i in idxs]
+
+def bm25_search(q: str, top_k: int = 100) -> List[Tuple[int, float]]:
+    toks = normalize_tokens(tokenize(q))
+    if BM25:
+        scores = np.array(BM25.get_scores(toks), dtype=np.float64)
+    else:
+        # простой TF fallback
+        scores_list = []
+        for doc in DOCS_TOKENS:
+            if not doc:
+                scores_list.append(0.0); continue
+            s = 0
+            for t in toks:
+                s += doc.count(t)
+            scores_list.append(float(s))
+        scores = np.array(scores_list, dtype=np.float64)
+    idxs = _topk_desc(scores, top_k)
+    return [(int(i), float(scores[i])) for i in idxs]
+
 
 def hyde_passage(question: str) -> Optional[str]:
     if not HYDE:
@@ -394,45 +431,31 @@ def hyde_passage(question: str) -> Optional[str]:
         return (resp.choices[0].message.content or "").strip()
     except Exception:
         return None
-# ───────────────────── Sparse/BM25 поиск ────────────────────────
 
-def bm25_search(q: str, top_k: int = 100) -> List[Tuple[int, float]]:
-    toks = normalize_tokens(tokenize(q))
-    
-    if BM25:
-        scores = BM25.get_scores(toks)
-        idxs = np.argsort(-scores)[:top_k]
-        return [(int(i), float(scores[i])) for i in idxs]
-    # Fallback: простой keyword-скоринг с TF (веса урезаны)
-    scores = []
-    for i, doc in enumerate(DOCS_TOKENS):
-        if not doc: 
-            scores.append(0.0)
-            continue
-        s = 0
-        for t in toks:
-            s += doc.count(t)
-        scores.append(float(s))
-    idxs = np.argsort(-np.array(scores))[:top_k]
-    return [(int(i), float(scores[i])) for i in idxs]
 
 # ───────────────────── Маппинги и регэкспы ──────────────────────
 
 KEY_REGEXES = [
-    # пример: «п. 29», «пункт 30», «по пункту 41» и т.п.
-    r"\bп\.?\s*(\d{1,3})\b",
-    r"\bпункт[а-я]*\s*(\d{1,3})\b",
+    r"\bп\.?\s*(\d{1,3})(?:\.(\d{1,3}))?\b",
+    r"\bпункт[а-я]*\s*(\d{1,3})(?:\.(\d{1,3}))?\b",
+    r"\bподпункт[а-я]*\s*(\d{1,3})\.(\d{1,3})\b",
+    r"\bпп\.\s*(\d{1,3})\.(\d{1,3})\b",
 ]
+
 
 def regex_hits(q: str) -> List[int]:
     hits: List[int] = []
+    ql = (q or "").lower()
     for rgx in KEY_REGEXES:
-        for m in re.finditer(rgx, q.lower()):
-            num = m.group(1)
+        for m in re.finditer(rgx, ql):
+            pn = (m.group(1) or "").strip()
+            sp = (m.group(2) or "").strip() if (m.lastindex or 0) >= 2 else ""
             for i, p in enumerate(PUNKTS):
-                if p.get("punkt_num") == num:
+                if str(p.get("punkt_num","")).strip() == pn and (not sp or str(p.get("subpunkt_num","")).strip() == sp):
                     hits.append(i)
+    # убрать дубликаты, сохранив порядок
     return list(dict.fromkeys(hits))
+
 
 def mapped_hits(q: str) -> List[int]:
     ql = q.lower()
@@ -452,42 +475,74 @@ def mapped_hits(q: str) -> List[int]:
 # ───────────────────────── Merge & Score ────────────────────────
 
 
+# ---- небольшой LRU-кэш для эмбеддингов запроса ----
+_EMB_CACHE: "OrderedDict[str, np.ndarray]" = OrderedDict()
+_EMB_CACHE_CAP = 512
+_EMB_LOCK = threading.Lock()  # NEW
+
+def _emb_cache_get(key: str) -> Optional[np.ndarray]:
+    with _EMB_LOCK:
+        if key in _EMB_CACHE:
+            vec = _EMB_CACHE.pop(key)
+            _EMB_CACHE[key] = vec
+            return vec
+    return None
+
+def _emb_cache_put(key: str, vec: np.ndarray) -> None:
+    with _EMB_LOCK:
+        if key in _EMB_CACHE:
+            _EMB_CACHE.pop(key)
+        _EMB_CACHE[key] = vec
+        if len(_EMB_CACHE) > _EMB_CACHE_CAP:
+            _EMB_CACHE.popitem(last=False)
+
+
+def embed_query(text: str) -> np.ndarray:  # override
+    key = (text or "").strip()
+    got = _emb_cache_get(key)
+    if got is not None:
+        return got
+    resp = call_with_retries(
+        client.embeddings.create,
+        model=EMBEDDING_MODEL,
+        input=key,
+    )
+    vec = np.array(resp.data[0].embedding, dtype=np.float64)
+    _emb_cache_put(key, vec)
+    return vec
+
+# ---- rag_search с условным HyDE и более узким final_k для категорий ----
 def rag_search(q: str, top_k_stage1: int = 120, final_k: int = 45) -> List[Dict[str, Any]]:
-    """
-    Гибридный retrieve: эмбеддинги + BM25 + маппинги/регэкспы + тематические бусты.
-    Плюс форс-добавление «канонических» пунктов для категорий (п.5.x),
-    процедурных пунктов (п.10) и порога ОЗП (п.39), а также п.32 для зарубежной магистратуры.
-    """
     q = normalize_query(q)
     ql = q.lower().replace("ё", "е")
 
-    # определим, есть ли вопрос про категорию (с учётом синонимов)
     def _is_cat_q(ql_: str) -> Optional[str]:
         for key, syns in CATEGORY_SYNONYMS.items():
             if any(s in ql_ for s in syns):
                 return key
         return None
+
     cat_key = _is_cat_q(ql)
     is_category_q = cat_key is not None
-
-    # для категорий снижаем финальный K — меньше шума
     if is_category_q:
-        final_k = min(final_k, 30)
+        final_k = min(final_k, 24)  # было 30, сузим ещё сильнее
 
     variants = multi_query_rewrites(q)
     dense_agg: Dict[int, float] = {}
     sparse_agg: Dict[int, float] = {}
 
-    # Dense
+    # Dense pass 1
     for v in variants:
         for idx, sc in vector_search(v, top_k=top_k_stage1):
             dense_agg[idx] = max(dense_agg.get(idx, 0.0), sc)
 
-    # HyDE
-    hyde = hyde_passage(q)
-    if hyde:
-        for idx, sc in vector_search(hyde, top_k=top_k_stage1 // 2):
-            dense_agg[idx] = max(dense_agg.get(idx, 0.0), sc)
+    # Условный HyDE: включаем только если сигнал слабый
+    best_dense = (max(dense_agg.values()) if dense_agg else 0.0)
+    if HYDE and best_dense < 0.30:
+        hyde = hyde_passage(q)
+        if hyde:
+            for idx, sc in vector_search(hyde, top_k=top_k_stage1 // 2):
+                dense_agg[idx] = max(dense_agg.get(idx, 0.0), sc)
 
     # Sparse
     for v in [q] + variants:
@@ -505,7 +560,7 @@ def rag_search(q: str, top_k_stage1: int = 120, final_k: int = 45) -> List[Dict[
         for k in list(sparse_agg.keys()):
             sparse_agg[k] = (sparse_agg[k] - mu) / sigma
 
-    # Сводный скор
+    # сводный скор
     items: List[Tuple[int, float]] = []
     candidate_ids = set(list(dense_agg.keys()) + list(sparse_agg.keys()) + regex_idx + mapped_idx)
     for idx in candidate_ids:
@@ -528,30 +583,24 @@ def rag_search(q: str, top_k_stage1: int = 120, final_k: int = 45) -> List[Dict[
     must_have.extend(mapped_idx + regex_idx)
 
     if is_category_q:
-        # все упоминания целевой категории
         for i, p in enumerate(PUNKTS):
             txt = (p.get("text") or "").lower().replace("ё", "е")
             if cat_key and cat_key in txt:
                 must_have.append(i)
-        # канонический подпункт п.5.x — на самый верх
         pn, sp = CAT_CANON.get(cat_key, ("", ""))
         if pn:
             canon_ids = [i for i, p in enumerate(PUNKTS)
                          if str(p.get("punkt_num","")).strip()==pn
                          and str(p.get("subpunkt_num","")).strip()==sp]
             must_have = canon_ids + must_have
-        # процедура и порог
         for wanted in ("10", "39"):
-            add = [i for i, p in enumerate(PUNKTS)
-                   if str(p.get("punkt_num","")).strip()==wanted]
+            add = [i for i, p in enumerate(PUNKTS) if str(p.get("punkt_num","")).strip()==wanted]
             must_have.extend(add)
 
-    # зарубеж/магистратура — п.32 вверх
     if any(k in ql for k in ("магист", "зарубеж", "за границ", "иностран", "болаш", "nazarbayev")):
         p32 = [i for i, p in enumerate(PUNKTS) if str(p.get("punkt_num","")).strip()=="32"]
         must_have = p32 + must_have
 
-    # итог без дублей
     top_idx: List[int] = []
     for i in must_have + ranked:
         if i not in top_idx:
@@ -1497,7 +1546,16 @@ def log_to_sheet_safe(user_id: int, question: str, short_answer: str) -> None:
 # ───────────────────────── HTTP хендлеры ────────────────────────
 
 async def handle_health(request: web.Request) -> web.Response:
-    return web.Response(text="ok")
+    ok = (PUNKT_EMBS.ndim == 2 and PUNKT_EMBS.shape[0] == len(PUNKTS))
+    payload = {
+        "ok": ok,
+        "punkts": len(PUNKTS),
+        "emb_shape": list(PUNKT_EMBS.shape),
+        "bm25": bool(BM25 is not None),
+        "cache_size": len(_EMB_CACHE) if "_EMB_CACHE" in globals() else 0,
+    }
+    return web.json_response(payload)
+
 
 async def handle_webhook(request: web.Request) -> web.Response:
     if TELEGRAM_WEBHOOK_SECRET:
@@ -1519,23 +1577,23 @@ async def handle_webhook(request: web.Request) -> web.Response:
         key = (int(chat_id), int(message_id))
         stash = LAST_RESPONSES.get(key)
 
-        tg_answer_callback_query(cq.get("id"))
+        await run_blocking(tg_answer_callback_query, cq.get("id"))
 
         if not stash:
-            tg_edit_message_text(chat_id, message_id, "Данные недоступны. Отправьте вопрос заново.")
+            await run_blocking(tg_edit_message_text, chat_id, message_id, "Данные недоступны. Отправьте вопрос заново.")
             return web.Response(text="ok")
 
         if action == "show_detailed":
             detailed = stash["detailed_html"]
             if len(detailed) <= 4000:
-                tg_edit_message_text(chat_id, message_id, detailed, reply_markup=kb_show_short())
+                await run_blocking(tg_edit_message_text, chat_id, message_id, detailed, reply_markup=kb_show_short())
             else:
                 notice = stash["short_html"] + "\n\n<i>Подробный ответ отправлен отдельными сообщениями ниже.</i>"
-                tg_edit_message_text(chat_id, message_id, notice, reply_markup=kb_show_short())
+                await run_blocking(tg_edit_message_text, chat_id, message_id, notice, reply_markup=kb_show_short())
                 for chunk in split_for_telegram(detailed, 4000):
-                    tg_send_message(chat_id, chunk)
+                    await run_blocking(tg_send_message, chat_id, chunk)
         elif action == "show_short":
-            tg_edit_message_text(chat_id, message_id, stash["short_html"], reply_markup=kb_show_detailed())
+            await run_blocking(tg_edit_message_text, chat_id, message_id, stash["short_html"], reply_markup=kb_show_detailed())
 
         return web.Response(text="ok")
 
@@ -1549,58 +1607,63 @@ async def handle_webhook(request: web.Request) -> web.Response:
         return web.Response(text="ok")
 
     if text.strip().startswith("/start"):
-        tg_send_message(chat_id, "Здравствуйте! Задайте вопрос по Правилам аттестации педагогов — я отвечу с цитатами.")
+        await run_blocking(tg_send_message, chat_id, "Здравствуйте! Задайте вопрос по Правилам аттестации педагогов — я отвечу с цитатами.")
         return web.Response(text="ok")
 
     if not text.strip():
-        tg_send_message(chat_id, "Пожалуйста, пришлите текстовый вопрос.")
+        await run_blocking(tg_send_message, chat_id, "Пожалуйста, пришлите текстовый вопрос.")
         return web.Response(text="ok")
 
-    try:
-        punkts = rag_search(text)
-        data_struct = ask_llm(text, punkts)
+    # Пер-чатовая блокировка
+    lock = LOCKS.setdefault(int(chat_id), asyncio.Lock())
+    if lock.locked():
+        await run_blocking(tg_send_message, chat_id, "Уже обрабатываю ваш предыдущий вопрос, одну секунду 🙌")
+        return web.Response(text="ok")
 
-        # ДО рендера — подстрахуем short_answer по найденному контексту
-                # ДО рендера — подстрахуем short_answer
-        context_text = build_context_snippets(punkts)
-        data_struct = ensure_min_citations(text, data_struct, punkts)
-        data_struct = enforce_short_answer(text, data_struct, context_text)
+    async with lock:
+        try:
+            punkts = await run_blocking(rag_search, text)
+            data_struct = await run_blocking(ask_llm, text, punkts)
 
-        # НОВОЕ: подправим reasoned_answer, если вопрос про категорию
-        data_struct = enforce_reasoned_answer(text, data_struct, punkts)
+            # Контекст для подстраховки short_answer
+            context_text = build_context_snippets(punkts)
 
-        # HTML
-        short_html = render_short_html(text, data_struct)
-        detailed_html = render_detailed_html(text, data_struct, punkts)
+            # Сначала гарантируем минимум цитат → затем шлифуем short_answer → затем reasoned_answer
+            data_struct = ensure_min_citations(text, data_struct, punkts)
+            data_struct = enforce_short_answer(text, data_struct, context_text)
+            data_struct = enforce_reasoned_answer(text, data_struct, punkts)
 
+            # HTML
+            short_html = render_short_html(text, data_struct)
+            detailed_html = render_detailed_html(text, data_struct, punkts)
 
-        # отправляем short; если длиннее лимита Telegram — разобьём
-        if len(short_html) <= 4000:
-            msg_id = tg_send_message(chat_id, short_html, reply_markup=kb_show_detailed())
-        else:
-            parts = split_for_telegram(short_html, 4000)
-            msg_id = tg_send_message(chat_id, parts[0], reply_markup=kb_show_detailed())
-            for extra in parts[1:]:
-                tg_send_message(chat_id, extra)
+            # отправляем short; если длиннее — разбиваем
+            if len(short_html) <= 4000:
+                msg_id = await run_blocking(tg_send_message, chat_id, short_html, reply_markup=kb_show_detailed())
+            else:
+                parts = split_for_telegram(short_html, 4000)
+                msg_id = await run_blocking(tg_send_message, chat_id, parts[0], reply_markup=kb_show_detailed())
+                for extra in parts[1:]:
+                    await run_blocking(tg_send_message, chat_id, extra)
 
-        if msg_id:
-            key = (int(chat_id), int(msg_id))
-            LAST_RESPONSES[key] = {
-                "message_id": int(msg_id),
-                "short_html": short_html,
-                "detailed_html": detailed_html,
-            }
+            if msg_id:
+                key = (int(chat_id), int(msg_id))
+                LAST_RESPONSES[key] = {
+                    "message_id": int(msg_id),
+                    "short_html": short_html,
+                    "detailed_html": detailed_html,
+                }
 
-        if len(LAST_RESPONSES) > 200:
-            FIRST = next(iter(LAST_RESPONSES))
-            if FIRST != key:
-                LAST_RESPONSES.pop(FIRST, None)
+            if len(LAST_RESPONSES) > 200:
+                FIRST = next(iter(LAST_RESPONSES))
+                if FIRST != key:
+                    LAST_RESPONSES.pop(FIRST, None)
 
-        log_to_sheet_safe(chat_id, text, data_struct.get("short_answer", ""))
+            await run_blocking(log_to_sheet_safe, chat_id, text, data_struct.get("short_answer", ""))
 
-    except Exception:
-        logger.exception("Processing failed")
-        tg_send_message(chat_id, "Произошла ошибка при обработке запроса. Попробуйте позже.")
+        except Exception:
+            logger.exception("Processing failed")
+            await run_blocking(tg_send_message, chat_id, "Произошла ошибка при обработке запроса. Попробуйте позже.")
 
     return web.Response(text="ok")
 
