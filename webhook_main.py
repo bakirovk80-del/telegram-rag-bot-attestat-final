@@ -492,7 +492,7 @@ def rag_search(q: str, top_k_stage1: int = 120, final_k: int = 45) -> List[Dict[
 
   
     # 2.3) если вопрос про зарубеж/магистратуру — форсим п.32
-    foreign_q = any(k in ql for k in ("магист", "зарубеж", "за границ", "иностран", "болаш", "nazarbayev"))
+    foreign_q = any(k in ql for k in ("магист", "зарубеж", "за границ", "иностран", "болаш", "nazarbayev", "nazarbayev university"))
     if foreign_q:
         forced_32 = [i for i, p in enumerate(PUNKTS) if str(p.get("punkt_num","")).strip() == "32"]
         # ставим п.32 в самое начало must_have
@@ -958,62 +958,108 @@ def filter_citations_by_question(
     punkts: List[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
     """
-    Делает цитаты максимально релевантными вопросу.
-    — Для «зарубеж/магистратура/Болашак» поднимает п. 32 на первое место и ограничивает 1–2 цитатами.
-    — Для вопросов про конкретную категорию (исследователь/модератор/эксперт/мастер) оставляет пункты,
-      где категория названа явно (до 3 шт.).
-    — Пункты 3 и 41 как «доказательство» убираются (на случай, если пришли от LLM до валидации).
-    — В остальных случаях слегка ограничивает длину (до 3 шт.).
+    Делает цитаты максимально релевантными вопросу + перекраивает quote на нужный фрагмент.
+    — «зарубеж/магистратура/Болашак»: п.32 первым, максимум 1–2 цитаты, quote вырезаем вокруг ключевых слов.
+    — «конкретная категория»: оставляем пункты, где категория названа явно (до 3), quote вырезаем вокруг категории.
+    — Пункты 3 и 41 выкидываем как «доказательство».
+    — По умолчанию: до 3 цитат.
     """
+    import re
     ql = (question or "").lower().replace("ё", "е")
     if not citations:
         return citations
 
-    # Текст по ключу пункта → для проверки релевантности
-    by_key = {
-        (str(p.get("punkt_num", "")), str(p.get("subpunkt_num", ""))):
-            (p.get("text") or "").lower().replace("ё", "е")
+    # Полные тексты пунктов по ключу
+    by_key_full = {
+        (str(p.get("punkt_num", "")), str(p.get("subpunkt_num", ""))): (p.get("text") or "")
         for p in punkts
     }
+    by_key = {
+        k: v.lower().replace("ё", "е") for k, v in by_key_full.items()
+    }
 
-    # Базовая очистка: убираем 3/41 на всякий случай (validate_citations уже делает это, но продублируем)
+    # На всякий случай выкинем 3/41 (validate_citations уже делает это)
     clean = [c for c in citations if str(c.get("punkt_num", "")) not in {"3", "41"}]
     if not clean:
         clean = citations[:]
 
-    # Триггеры
+    # Хелпер: вырезать 180-символьный отрывок вокруг первого попадания любой из ключевых фраз
+    def _crop_around(text_full: str, keys: Tuple[str, ...], width: int = 180) -> str:
+        tf = re.sub(r"\s+", " ", text_full or "").strip()
+        tl = tf.lower().replace("ё", "е")
+        pos = -1
+        for k in keys:
+            i = tl.find(k)
+            if i != -1 and (pos == -1 or i < pos):
+                pos = i
+        if pos == -1:
+            return tf[:width] + ("…" if len(tf) > width else "")
+        # центрируем окно около попадания
+        pad = width // 2
+        start = max(0, pos - pad)
+        end = min(len(tf), pos + pad)
+        # обрезка по словам
+        while start > 0 and tf[start] not in " .,;:!?()[]{}«»":
+            start -= 1
+        while end < len(tf) and tf[end-1] not in " .,;:!?()[]{}«»":
+            end += 1
+        snippet = tf[start:end].strip()
+        return snippet[:width] + ("…" if len(snippet) > width else "")
+
+    # Если вопрос про «зарубеж/магистратуру»
     foreign = any(k in ql for k in ("магист", "зарубеж", "за границ", "иностран", "болаш", "bolash", "nazarbayev"))
     category_keys = ("исследовател", "модератор", "эксперт", "мастер")
     is_category_q = any(k in ql for k in category_keys)
 
-    # ── Случай «зарубеж/магистратура»: ставим п.32 первым и режем до 2 ──
     if foreign:
         p32 = [c for c in clean if str(c.get("punkt_num", "")).strip() == "32"]
         rest = [c for c in clean if str(c.get("punkt_num", "")).strip() != "32"]
+        pref_terms = ("зарубеж", "болаш", "nazarbayev", "без прохождения")
 
-        preferred_terms = ("зарубеж", "болаш", "nazarbayev", "без прохождения")
-        def _relevant_foreign(c: Dict[str, Any]) -> bool:
-            key = (str(c.get("punkt_num", "")), str(c.get("subpunkt_num", "")))
-            txt = by_key.get(key, "")
-            return any(t in txt for t in preferred_terms)
+        def _rel(c: Dict[str, Any]) -> bool:
+            key = (str(c.get("punkt_num","")), str(c.get("subpunkt_num","")))
+            return any(t in by_key.get(key, "") for t in pref_terms)
 
-        # Сначала релевантные фрагменты, затем всё остальное
-        rest_sorted = sorted(rest, key=lambda c: (not _relevant_foreign(c)))
-        ordered = p32 + rest_sorted
-        return (ordered[:2] or clean[:2])
+        ordered = p32 + sorted(rest, key=lambda c: (not _rel(c)))
+        out = (ordered[:2] or clean[:2])
 
-    # ── Случай «конкретная категория»: оставляем пункты, где категория названа явно ──
+        # Перекраиваем quote на релевантное место
+        for c in out:
+            key = (str(c.get("punkt_num","")), str(c.get("subpunkt_num","")))
+            base_full = by_key_full.get(key, "")  # исходный текст пункта (без lower)
+            if base_full:
+                c["quote"] = _crop_around(base_full, pref_terms)
+        return out
+
     if is_category_q:
         def _mentions_category(c: Dict[str, Any]) -> bool:
-            key = (str(c.get("punkt_num", "")), str(c.get("subpunkt_num", "")))
-            txt = by_key.get(key, "")
-            return any(k in txt for k in category_keys)
+            key = (str(c.get("punkt_num","")), str(c.get("subpunkt_num","")))
+            return any(k in by_key.get(key, "") for k in category_keys)
 
         cat_cits = [c for c in clean if _mentions_category(c)]
-        return (cat_cits or clean)[:3]
+        out = (cat_cits or clean)[:3]
 
-    # ── По умолчанию: компактно ──
-    return clean[:3]
+        # Выбираем ключ согласно вопросу (точнее таргетим)
+        target = next((k for k in category_keys if k in ql), None)
+        target_terms = (target,) if target else category_keys
+
+        # Перекраиваем quote так, чтобы в отрывок попала нужная категория
+        for c in out:
+            key = (str(c.get("punkt_num","")), str(c.get("subpunkt_num","")))
+            base_full = by_key_full.get(key, "")
+            if base_full:
+                c["quote"] = _crop_around(base_full, target_terms)
+        return out
+
+    # По умолчанию — компактно до 3 и безопасный quote, если LLM дал пустой
+    out = clean[:3]
+    for c in out:
+        if not (c.get("quote") or "").strip():
+            key = (str(c.get("punkt_num","")), str(c.get("subpunkt_num","")))
+            base_full = by_key_full.get(key, "")
+            if base_full:
+                c["quote"] = _crop_around(base_full, tuple())
+    return out
 
 
 def split_for_telegram(text: str, limit: int = 4000) -> List[str]:
