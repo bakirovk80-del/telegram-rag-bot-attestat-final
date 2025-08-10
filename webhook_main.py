@@ -126,7 +126,7 @@ W_MAP = 1.25
 W_REGEX = 0.15
 
 # категории (усиливаем вклад)
-W_CAT = 2.2
+W_CAT = 2.6
 CAT_KEYS = ("исследовател", "модератор", "эксперт", "мастер")
 
 # канонические подпункты для категорий (п.5.x)
@@ -138,12 +138,25 @@ CAT_CANON = {
 }
 
 # синонимы/варианты упоминания категорий в вопросах
+# синонимы/варианты упоминания категорий в вопросах (ловим опечатки и англ/кз)
 CATEGORY_SYNONYMS = {
-    "исследовател": ("исследовател", "research", "зерттеуш", "pedagog-issled"),
-    "модератор":    ("модератор",),
-    "эксперт":      ("эксперт",),
-    "мастер":       ("мастер",),
+    "исследовател": (
+        "исследовател", "исследователь", "исследоват", "иследовател",  # опечатки/корни
+        "research", "issled", "issledovatel", "зерттеуш", "зерттеуші", "pedagog-issled"
+    ),
+    "модератор":    ("модератор", "moderator", "moderat"),
+    "эксперт":      ("эксперт", "expert", "ekspert"),
+    "мастер":       ("мастер", "master"),
 }
+
+# человекочитаемые подписи для вывода
+CATEGORY_LABEL = {
+    "исследовател": "исследователь",
+    "модератор":    "модератор",
+    "эксперт":      "эксперт",
+    "мастер":       "мастер",
+}
+
 
 # ключи, по которым считаем, что речь про ОЗП/порог (для п.39)
 KW_OZP_TERMS = ("озп", "оценка знаний педагогов", "порог", "тестирован", "80 %", "80%")
@@ -573,7 +586,8 @@ GEN_PROMPT_TEMPLATE = """\
 4) Для вопросов про зарубежную магистратуру/иностр. образование, если в контексте есть освобождение (напр., п.32):
    — отрази это в short_answer в формате "Зависит: …; иначе — по общим правилам" и процитируй норму как первую в "citations".
 5) Для вопросов про конкретную категорию (модератор/эксперт/исследователь/мастер) — среди "citations" должна быть цитата,
-   где категория названа явно.
+   где категория названа явно, с конкретным подпунктом (например, п. 5.4 для «педагога-исследователя»).
+
 5a) Если вопрос про конкретную категорию — в "reasoned_answer" сделай КОРОТКИЙ маркированный список (2–6 пунктов)
      ключевых компетенций ИСКЛЮЧИТЕЛЬНО из процитированного п.5.x (без домыслов), затем один абзац с процедурой (если процитированы соответствующие пункты).
 6) JSON — без лишних полей, без комментариев, кавычки только двойные.
@@ -902,6 +916,62 @@ def enforce_short_answer(question: str, data: dict, ctx_text: str) -> dict:
     return data
 
 
+def ensure_min_citations(question: str, data: Dict[str, Any], punkts: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Гарантирует минимум 2 релевантные цитаты.
+    Для категорий — п.5.<канон> → п.10 → п.39.
+    Для зарубеж/магистратуры — п.32 → п.10 (если есть в контексте).
+    Иначе — первые 2 из выданного контекста.
+    """
+    ql = (question or "").lower().replace("ё", "е")
+    cits = data.get("citations") or []
+
+    def _exists(pn: str, sp: str = "") -> Optional[Dict[str, str]]:
+        for p in punkts:
+            if str(p.get("punkt_num","")).strip()==pn and (sp=="" or str(p.get("subpunkt_num","")).strip()==sp):
+                return {"punkt_num": pn, "subpunkt_num": sp, "quote": ""}
+        return None
+
+    # уже достаточно цитат?
+    if len([1 for c in cits if str(c.get("punkt_num","")).strip() not in {"3","41"}]) >= 2:
+        return data
+
+    # определяется целевая категория
+    target = None
+    for key, syns in CATEGORY_SYNONYMS.items():
+        if any(s in ql for s in syns):
+            target = key
+            break
+    is_foreign = any(k in ql for k in ("магист","зарубеж","за границ","иностран","болаш","bolash","nazarbayev"))
+
+    need: List[Dict[str,str]] = []
+    if target:
+        pn, sp = CAT_CANON.get(target, ("",""))
+        if pn:
+            h = _exists(pn, sp)
+            if h: need.append(h)
+        h10 = _exists("10", "")
+        if h10: need.append(h10)
+        h39 = _exists("39", "")
+        if h39: need.append(h39)
+    elif is_foreign:
+        h32 = _exists("32", "")
+        if h32: need.append(h32)
+        h10 = _exists("10", "")
+        if h10: need.append(h10)
+
+    # если ничего не нашли — возьмём первые 2 из контекста
+    if not need:
+        for p in punkts[:2]:
+            need.append({
+                "punkt_num": str(p.get("punkt_num","")).strip(),
+                "subpunkt_num": str(p.get("subpunkt_num","")).strip(),
+                "quote": ""
+            })
+
+    merged = (cits or []) + need
+    data["citations"] = validate_citations(merged, punkts)[:3]  # подрежем до 3
+    return data
 
 
 
@@ -1140,9 +1210,9 @@ def filter_citations_by_question(
     return out
 def enforce_reasoned_answer(question: str, data: Dict[str, Any], punkts: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Если вопрос про категорию и LLM дал «вату», заменяем/добавляем:
+    Для вопросов про категорию:
     — короткий маркированный список (2–6 пунктов) компетенций из канонического п.5.x;
-    — затем одна строка про процедуру, если п.10 присутствует в цитатах/контексте.
+    — затем одна строка про процедуру (п.10), если он есть в контексте/цитатах.
     """
     ql = (question or "").lower().replace("ё", "е")
 
@@ -1153,6 +1223,9 @@ def enforce_reasoned_answer(question: str, data: Dict[str, Any], punkts: List[Di
             target = key; break
     if not target:
         return data
+
+    # человекочитаемая метка
+    human = CATEGORY_LABEL.get(target, target)
 
     # найти канонический п.5.x
     pn, sp = CAT_CANON.get(target, ("",""))
@@ -1166,17 +1239,14 @@ def enforce_reasoned_answer(question: str, data: Dict[str, Any], punkts: List[Di
 
     def _bullets_from(text: str, max_items: int = 6) -> List[str]:
         t = _collapse_repeats(text)
-        # грубая, но устойчиво работает на перечнях компетенций
         parts = re.split(r"(?:\n+|•|—|\u2014|;|\.\s+|\d+\)|\d+\.)", t)
         parts = [re.sub(r"[ \t]+"," ", s).strip(" -—•.;") for s in parts]
-        parts = [s for s in parts if 20 <= len(s) <= 220]  # отсечь мусор/коротыши
-        uniq = []
-        seen = set()
+        parts = [s for s in parts if 20 <= len(s) <= 220]
+        uniq, seen = [], set()
         for s in parts:
             key = s.lower()[:80]
             if key not in seen:
-                seen.add(key)
-                uniq.append(s)
+                seen.add(key); uniq.append(s)
             if len(uniq) >= max_items:
                 break
         return uniq[:max_items]
@@ -1185,23 +1255,21 @@ def enforce_reasoned_answer(question: str, data: Dict[str, Any], punkts: List[Di
     if not bullets:
         return data
 
-    # процедура есть?
-    cites = {(str(c.get("punkt_num","")).strip()) for c in (data.get("citations") or [])}
+    cites = {str(c.get("punkt_num","")).strip() for c in (data.get("citations") or [])}
     have_p10 = ("10" in cites) or any(str(p.get("punkt_num","")).strip()=="10" for p in punkts)
 
-    # собираем reasoned_answer
-    lines = [f"Ключевые компетенции («педагог-{target}», п.{pn}.{sp}):"]
+    lines = [f"Ключевые компетенции («педагог-{human}», п.{pn}.{sp}):"]
     lines += [f"— {b}" for b in bullets[:6]]
     if have_p10:
         lines.append("Процедура: заявление → портфолио → ОЗП → обобщение → решение комиссии (п.10).")
 
     current = (data.get("reasoned_answer") or "").strip()
-    # если у модели уже был осмысленный список, не перетираем — только дополняем
     if len(current) < 60 or "— " not in current:
         data["reasoned_answer"] = "\n".join(lines)
     else:
         data["reasoned_answer"] = current + "\n\n" + "\n".join(lines)
     return data
+
 
 def split_for_telegram(text: str, limit: int = 4000) -> List[str]:
     parts: List[str] = []
@@ -1436,8 +1504,12 @@ async def handle_webhook(request: web.Request) -> web.Response:
         data_struct = ask_llm(text, punkts)
 
         # ДО рендера — подстрахуем short_answer по найденному контексту
+                # ДО рендера — подстрахуем short_answer
         context_text = build_context_snippets(punkts)
         data_struct = enforce_short_answer(text, data_struct, context_text)
+
+        # НОВОЕ: гарантируем минимум цитат по нужному порядку
+        data_struct = ensure_min_citations(text, data_struct, punkts)
 
         # НОВОЕ: подправим reasoned_answer, если вопрос про категорию
         data_struct = enforce_reasoned_answer(text, data_struct, punkts)
@@ -1445,6 +1517,7 @@ async def handle_webhook(request: web.Request) -> web.Response:
         # HTML
         short_html = render_short_html(text, data_struct)
         detailed_html = render_detailed_html(text, data_struct, punkts)
+
 
         # отправляем short; если длиннее лимита Telegram — разобьём
         if len(short_html) <= 4000:
