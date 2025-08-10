@@ -755,9 +755,11 @@ def ask_llm(question: str, punkts: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     # иностр. образование — хотим видеть спец-норму
     ql = (question or "").lower()
-    if any(k in ql for k in ("магист", "за рубеж", "за границ", "зарубеж", "иностран", "болаш", "bolash", "nazarbayev university")):
+    if any(k in ql for k in ("магист", "за рубеж", "за границ", "зарубеж", "иностран", "болаш", "bolash", "nazarbayev", "nazarbayev university")):
         if "32" not in _cit_pts(data["citations"]):
             need_reask = True
+
+    
 
     # слишком мало уникальных цитат?
     uniq_cits = {(c.get("punkt_num",""), c.get("subpunkt_num","")) for c in data["citations"]}
@@ -845,6 +847,12 @@ def enforce_short_answer(question: str, data: dict, ctx_text: str) -> dict:
     bad = {"3","41"}
     if (cites & bad):
         sa = re.sub(r"\b(обязан|обязательно|должен|необходимо)\b", "требуется по общим нормам", sa, flags=re.I)
+    # Если это вопрос про категорию и среди цитат есть п.10 (про процедуру) — добавим компактные этапы
+    if is_category_q and "10" in cites and "→" not in sa:
+        tail = " (этапы: заявление → портфолио → ОЗП → обобщение → решение комиссии)"
+        if len(sa) + len(tail) <= 200:
+            sa += tail
+
 
     data["short_answer"] = sa[:200]
     return data
@@ -890,12 +898,15 @@ def validate_citations(citations: List[Dict[str, Any]], punkts: List[Dict[str, A
         base = (by_key.get((pn, sp), "") or "").strip()
         if not base:
             continue
-
         qt = (c.get("quote") or "").strip()
+        base_clean = re.sub(r"\s+", " ", base).strip()
         if qt and qt.lower() in base.lower():
-            good_quote = qt
+            qt_clean = re.sub(r"\s+", " ", qt).strip()
+            good_quote = qt_clean[:180] + ("…" if len(qt_clean) > 180 else "")
         else:
-            good_quote = base[:300] + ("…" if len(base) > 300 else "")
+            good_quote = base_clean[:180] + ("…" if len(base_clean) > 180 else "")
+
+
 
         out.append({"punkt_num": pn, "subpunkt_num": sp, "quote": good_quote})
 
@@ -909,6 +920,37 @@ def validate_citations(citations: List[Dict[str, Any]], punkts: List[Dict[str, A
             uniq.append(c)
 
     return uniq[:8]
+def _ensure_category_citation(question: str,
+                              citations: List[Dict[str, Any]],
+                              punkts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    ql = (question or "").lower().replace("ё", "е")
+    cats = ("исследовател", "модератор", "эксперт", "мастер")
+    target_cat = next((c for c in cats if c in ql), None)
+    if not target_cat:
+        return citations
+
+    # если уже есть цитата с нужной категорией — ничего не делаем
+    by_key_txt = {
+        (str(p.get("punkt_num","")).strip(), str(p.get("subpunkt_num","")).strip()):
+            (p.get("text") or "").lower().replace("ё", "е")
+        for p in punkts
+    }
+    def _mentions_cat(c: Dict[str, Any]) -> bool:
+        key = (str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip())
+        return target_cat in by_key_txt.get(key, "")
+
+    if any(_mentions_cat(c) for c in (citations or [])):
+        return citations
+
+    # иначе найдём подходящий пункт в контексте и добавим его первой цитатой
+    for p in punkts:
+        txt = (p.get("text") or "").lower().replace("ё", "е")
+        if target_cat in txt:
+            pn = str(p.get("punkt_num","")).strip()
+            sp = str(p.get("subpunkt_num","")).strip()
+            return [{"punkt_num": pn, "subpunkt_num": sp, "quote": ""}] + (citations or [])
+    return citations
+
 # ── Фильтрация цитат по ключевым словам из вопроса ──
 def filter_citations_by_question(
     question: str,
@@ -1048,6 +1090,10 @@ def render_short_html(question: str, data: Dict[str, Any]) -> str:
 def render_detailed_html(question: str, data: Dict[str, Any], punkts: List[Dict[str, Any]]) -> str:
     sa = html.escape(data.get("short_answer", "")).strip()
     ra = html.escape(data.get("reasoned_answer", "")).strip()
+
+    # ДО валидации: гарантируем, что при вопросе про категорию первая цитата — с нужной категорией
+    data["citations"] = _ensure_category_citation(question, data.get("citations", []), punkts)
+
     citations = validate_citations(data.get("citations", []), punkts)
     citations = filter_citations_by_question(question, citations, punkts)
     related = data.get("related", [])
