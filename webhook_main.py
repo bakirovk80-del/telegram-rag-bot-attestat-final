@@ -1429,7 +1429,7 @@ def _ensure_category_citation(question: str,
     return citations
 
 # ── Фильтрация цитат по ключевым словам из вопроса ──
-ddef filter_citations_by_question(
+def filter_citations_by_question(
     question: str,
     citations: List[Dict[str, Any]],
     punkts: List[Dict[str, Any]]
