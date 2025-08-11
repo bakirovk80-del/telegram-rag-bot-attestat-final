@@ -106,7 +106,10 @@ assert WEBHOOK_URL, "WEBHOOK_URL is required (e.g., https://your-app.onrender.co
 PORT = int(os.environ.get("PORT", "8080"))
 WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", "/webhook")
 TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "").strip() or None
-
+# sanitize WEBHOOK_PATH/WEBHOOK_URL
+if not WEBHOOK_PATH.startswith("/"):
+    WEBHOOK_PATH = "/" + WEBHOOK_PATH
+WEBHOOK_URL = WEBHOOK_URL.rstrip("/")
 EMBEDDINGS_PATH = os.environ.get("EMBEDDINGS_PATH", "embeddings.npy")
 PUNKTS_PATH = os.environ.get("PUNKTS_PATH", "pravila_detailed_tagged_autofix.json")
 
@@ -1139,6 +1142,14 @@ def validate_citations(citations: List[Dict[str, Any]], punkts: List[Dict[str, A
             seen.add(key); uniq.append(c)
     return uniq[:8]
 
+async def handle_debug_webhook(request: web.Request) -> web.Response:
+    try:
+        r = requests.get(f"{TELEGRAM_API}/getWebhookInfo", timeout=15)
+        return web.json_response(r.json(), status=r.status_code)
+    except Exception as e:
+        logger.exception("getWebhookInfo failed")
+        return web.json_response({"error": str(e)}, status=500)
+
 
 def _ensure_category_citation(question: str,
                               citations: List[Dict[str, Any]],
@@ -1404,16 +1415,23 @@ def tg_send_message(chat_id: int, text: str, parse_mode: str = "HTML", reply_mar
         "disable_web_page_preview": True,
     }
     if reply_markup is not None:
-        payload["reply_markup"] = reply_markup  # добавляем только если объект
+        payload["reply_markup"] = reply_markup
 
     r = requests.post(url, json=payload, timeout=15)
-    if not r.ok:
-        logger.error("sendMessage failed: %s %s", r.status_code, r.text)
-        return None
     try:
-        return r.json().get("result", {}).get("message_id")
+        if r.ok:
+            return r.json().get("result", {}).get("message_id")
+        # fallback: убрать HTML при parse error
+        if "can't parse entities" in r.text.lower():
+            payload.pop("parse_mode", None)
+            r2 = requests.post(url, json=payload, timeout=15)
+            if r2.ok:
+                return r2.json().get("result", {}).get("message_id")
+        logger.error("sendMessage failed: %s %s", r.status_code, r.text)
     except Exception:
-        return None
+        logger.exception("sendMessage decode error")
+    return None
+
 
 
 def tg_edit_message_text(chat_id: int, message_id: int, text: str, parse_mode: str = "HTML", reply_markup: Optional[dict] = None) -> None:
@@ -1426,11 +1444,18 @@ def tg_edit_message_text(chat_id: int, message_id: int, text: str, parse_mode: s
         "disable_web_page_preview": True,
     }
     if reply_markup is not None:
-        payload["reply_markup"] = reply_markup  # добавляем только если объект
+        payload["reply_markup"] = reply_markup
 
     r = requests.post(url, json=payload, timeout=15)
-    if not r.ok:
-        logger.error("editMessageText failed: %s %s", r.status_code, r.text)
+    if r.ok:
+        return
+    if "can't parse entities" in r.text.lower():
+        payload.pop("parse_mode", None)
+        r2 = requests.post(url, json=payload, timeout=15)
+        if r2.ok:
+            return
+    logger.error("editMessageText failed: %s %s", r.status_code, r.text)
+
 
 def kb_show_detailed():
     return {"inline_keyboard": [[{"text": "Показать подробный ответ", "callback_data": "show_detailed"}]]}
@@ -1561,9 +1586,14 @@ async def handle_webhook(request: web.Request) -> web.Response:
     if TELEGRAM_WEBHOOK_SECRET:
         recv_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
         if recv_secret != TELEGRAM_WEBHOOK_SECRET:
+            logger.warning("Webhook rejected: secret mismatch or missing header. "
+                           "Most likely your reverse proxy drops 'X-Telegram-Bot-Api-Secret-Token'. "
+                           "Either pass the header through or unset TELEGRAM_WEBHOOK_SECRET.")
             return web.Response(status=403, text="forbidden")
 
+
     data = await request.json()
+    logger.info("Update keys: %s", list(data.keys()))
 
     # 1) CallbackQuery (кнопки)
     if "callback_query" in data:
@@ -1668,18 +1698,22 @@ async def handle_webhook(request: web.Request) -> web.Response:
     return web.Response(text="ok")
 
 # ─────────────────────────── main() ─────────────────────────────
+# в main():
+
 
 async def on_startup(app: web.Application):
     full_url = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
+
     tg_set_webhook(full_url, TELEGRAM_WEBHOOK_SECRET)
     logger.info("Service started on port %s", PORT)
+
 
 def main():
     app = web.Application()
 
     app.router.add_get("/health", handle_health)
     app.router.add_post(WEBHOOK_PATH, handle_webhook)
-
+    app.router.add_get("/debug/webhook", handle_debug_webhook)
     async def handle_root(request):
         return web.Response(text="ok")
     app.router.add_get("/", handle_root)
