@@ -142,8 +142,6 @@ CAT_CANON = {
     "эксперт":      ("5", "3"),
     "мастер":       ("5", "5"),
 }
-
-# синонимы/варианты упоминания категорий в вопросах
 # синонимы/варианты упоминания категорий в вопросах (ловим опечатки и англ/кз)
 CATEGORY_SYNONYMS = {
     "исследовател": (
@@ -162,6 +160,195 @@ CATEGORY_LABEL = {
     "эксперт":      "эксперт",
     "мастер":       "мастер",
 }
+
+# ─────────────────────── Intent + Policy (универсальный слой) ───────────────────────
+
+INTENT_KEYWORDS = {
+    "threshold": ("порог", "порогов", "пороговы", "балл", "баллы", "сколько баллов", "озп", "оценка знаний", "тест", "тестирован", "процент", "80%"),
+    "procedure": ("как сдать", "как проходит", "этап", "этапы", "заявлен", "подать", "портфолио", "комисси", "обобщен"),
+    "exemption_foreign": ("магист", "за рубеж", "зарубеж", "за границ", "иностран", "болаш", "bolash", "nazarbayev"),
+}
+
+def _detect_category_key(q: str) -> Optional[str]:
+    ql = (q or "").lower().replace("ё","е")
+    for key, syns in CATEGORY_SYNONYMS.items():
+        if any(s in ql for s in syns):
+            return key
+    return None
+
+def classify_question(q: str) -> Dict[str, Any]:
+    ql = (q or "").lower().replace("ё","е")
+    cat = _detect_category_key(ql)
+    # приоритет: порог → льготы зарубеж → требования/категория → процедура → general
+    if any(k in ql for k in INTENT_KEYWORDS["threshold"]):
+        return {"intent": "threshold", "category": cat, "confidence": 0.9}
+    if any(k in ql for k in INTENT_KEYWORDS["exemption_foreign"]):
+        return {"intent": "exemption_foreign", "category": None, "confidence": 0.9}
+    if cat:
+        return {"intent": "category_requirements", "category": cat, "confidence": 0.85}
+    if any(k in ql for k in INTENT_KEYWORDS["procedure"]):
+        return {"intent": "procedure", "category": None, "confidence": 0.75}
+    return {"intent": "general", "category": None, "confidence": 0.5}
+
+POLICIES = {
+    "threshold": {
+        "primary": [("39","")],                # всегда цитируем п.39
+        "secondary": [("10","")],              # процедура вторым номером
+        "max_citations": 3,
+        "short_template": "По общим правилам: порог ОЗП — {threshold_percent} (п. 39).{procedure_tail}"
+    },
+    "category_requirements": {
+        "primary": [("5","<cat>")],
+        "secondary": [("10",""), ("39","")],
+        "max_citations": 3,
+        "short_template": "По общим правилам: требования для «педагога-{cat_human}» см. п. 5.{cat_sp}."
+    },
+    "exemption_foreign": {
+        "primary": [("32","")],
+        "secondary": [("10","")],
+        "max_citations": 2,
+        "short_template": "Зависит: если магистратура из перечня — присваивают без аттестации (п.32); иначе — по общим правилам."
+    },
+    "procedure": {
+        "primary": [("10","")],
+        "secondary": [("39","")],
+        "max_citations": 3,
+        "short_template": "По общим правилам: этапы — заявление → портфолио → ОЗП → обобщение → решение комиссии (п.10)."
+    },
+    "general": {
+        "primary": [],
+        "secondary": [("10",""), ("39","")],
+        "max_citations": 3,
+        "short_template": "{fallback_short}"
+    }
+}
+
+def _policy_primary_pairs(intent: str, category_key: Optional[str]) -> List[Tuple[str,str]]:
+    pairs = []
+    if intent not in POLICIES: return pairs
+    for pn, sp in POLICIES[intent]["primary"]:
+        if sp == "<cat>":
+            if not category_key: continue
+            pn_c, sp_c = CAT_CANON.get(category_key, ("",""))
+            if pn_c: pairs.append((pn_c, sp_c))
+        else:
+            pairs.append((pn, sp))
+    return pairs
+
+def _human_cat(category_key: Optional[str]) -> Tuple[str, str]:
+    if not category_key: return ("", "")
+    human = CATEGORY_LABEL.get(category_key, category_key)
+    _, sp = CAT_CANON.get(category_key, ("",""))
+    return (human, sp)
+
+# ─────────── Slot-extractors (универсальные извлекатели фактов) ───────────
+def extract_threshold_percent_from_p39(punkts: List[Dict[str,Any]]) -> Optional[str]:
+    import re
+    for p in punkts:
+        if str(p.get("punkt_num","")).strip() == "39":
+            t = (p.get("text") or "")
+            # ищем числа %; если нет — словесное "восемьдесят"
+            perc = re.findall(r'(\d{1,3})\s*%', t)
+            if perc:
+                # берём максимальный процент, чтобы не промахнуться по формулировкам
+                try:
+                    m = max(int(x) for x in perc)
+                    return f"{m}%"
+                except Exception:
+                    return perc[-1] + "%"
+            if "восемьдесят процент" in t.lower(): return "80%"
+    return None
+
+def build_procedure_tail_if_p10(punkts: List[Dict[str,Any]]) -> str:
+    for p in punkts:
+        if str(p.get("punkt_num","")).strip() == "10":
+            return " (этапы: заявление → портфолио → ОЗП → обобщение → решение комиссии)"
+    return ""
+
+# ─────────── Policy-aware helpers для цитат и краткого ответа ───────────
+def ensure_min_citations_policy(question: str,
+                                data: Dict[str,Any],
+                                punkts: List[Dict[str,Any]],
+                                intent_info: Dict[str,Any]) -> Dict[str,Any]:
+    intent = intent_info.get("intent","general")
+    category_key = intent_info.get("category")
+    primary = _policy_primary_pairs(intent, category_key)
+    secondary = _policy_primary_pairs("secondary_override", None)  # заглушка, не используется
+    # формируем must-have список: primary из политики + если есть — вторичные из политики
+    want = list(primary)
+    for pn, sp in POLICIES.get(intent, {}).get("secondary", []):
+        if sp == "<cat>":
+            if category_key:
+                pn_c, sp_c = CAT_CANON.get(category_key, ("",""))
+                if pn_c: want.append((pn_c, sp_c))
+        else:
+            want.append((pn, sp))
+
+    # оставим существующие цитаты, но перед ними вставим нужные пункты (если они в контексте)
+    have = {(str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip())
+            for c in (data.get("citations") or [])}
+    out: List[Dict[str,str]] = []
+
+    def _exists(pn: str, sp: str="") -> bool:
+        for p in punkts:
+            if str(p.get("punkt_num","")).strip()==pn and (sp=="" or str(p.get("subpunkt_num","")).strip()==sp):
+                return True
+        return False
+
+    for pn, sp in want:
+        if _exists(pn, sp) and (pn, sp) not in have:
+            out.append({"punkt_num": pn, "subpunkt_num": sp, "quote": ""})
+
+    # добавим назад старые (без дублей)
+    for c in (data.get("citations") or []):
+        pn = str(c.get("punkt_num","")).strip()
+        sp = str(c.get("subpunkt_num","")).strip()
+        if (pn, sp) not in {(x["punkt_num"], x["subpunkt_num"]) for x in out}:
+            out.append({"punkt_num": pn, "subpunkt_num": sp, "quote": c.get("quote","")})
+
+    # ограничим количеством
+    maxc = POLICIES.get(intent, {}).get("max_citations", 3)
+    data["citations"] = out[:maxc]
+    return data
+
+def enforce_short_answer_policy(question: str,
+                                data: Dict[str,Any],
+                                punkts: List[Dict[str,Any]],
+                                intent_info: Dict[str,Any]) -> Dict[str,Any]:
+    intent = intent_info.get("intent","general")
+    category_key = intent_info.get("category")
+    policy = POLICIES.get(intent, POLICIES["general"])
+    templ = policy.get("short_template","{fallback_short}")
+
+    human, sp = _human_cat(category_key)
+    facts = {
+        "cat_human": human,
+        "cat_sp": sp,
+        "threshold_percent": extract_threshold_percent_from_p39(punkts) or "80%",
+        "procedure_tail": build_procedure_tail_if_p10(punkts)
+    }
+
+    fallback = (data.get("short_answer") or "По общим правилам.").strip()
+    sa = templ.format(fallback_short=fallback, **facts).strip()
+    data["short_answer"] = sa[:200]
+    return data
+
+def policy_get_must_have_pairs(intent_info: Dict[str,Any]) -> List[Tuple[str,str]]:
+    intent = intent_info.get("intent","general")
+    category_key = intent_info.get("category")
+    pairs = _policy_primary_pairs(intent, category_key)
+    # добавим вторичные только для category_requirements (10, 39 полезны)
+    if intent == "category_requirements":
+        for pn, sp in POLICIES[intent]["secondary"]:
+            if sp == "<cat>":
+                if category_key:
+                    pn_c, sp_c = CAT_CANON.get(category_key, ("",""))
+                    if pn_c: pairs.append((pn_c, sp_c))
+            else:
+                pairs.append((pn, sp))
+    return pairs
+
+
 
 
 # ключи, по которым считаем, что речь про ОЗП/порог (для п.39)
@@ -375,15 +562,6 @@ def _topk_desc(arr: np.ndarray, k: int) -> np.ndarray:
     idx = np.argpartition(-arr, k-1)[:k]
     return idx[np.argsort(-arr[idx])]
 
-def embed_query(text: str) -> np.ndarray:
-    # Перенесено сюда, чтобы кэш (в блоке 4) работал — саму реализацию кэша см. ниже.
-    resp = call_with_retries(
-        client.embeddings.create,
-        model=EMBEDDING_MODEL,
-        input=text,
-    )
-    vec = np.array(resp.data[0].embedding, dtype=np.float64)
-    return vec
 
 def vector_search(q: str, top_k: int = 100) -> List[Tuple[int, float]]:
     vec = embed_query(q)
@@ -515,7 +693,8 @@ def embed_query(text: str) -> np.ndarray:  # override
     return vec
 
 # ---- rag_search с условным HyDE и более узким final_k для категорий ----
-def rag_search(q: str, top_k_stage1: int = 120, final_k: int = 45) -> List[Dict[str, Any]]:
+def rag_search(q: str, top_k_stage1: int = 120, final_k: int = 45,
+               must_have_pairs: Optional[List[Tuple[str,str]]] = None) -> List[Dict[str, Any]]:
     q = normalize_query(q)
     ql = q.lower().replace("ё", "е")
 
@@ -603,7 +782,14 @@ def rag_search(q: str, top_k_stage1: int = 120, final_k: int = 45) -> List[Dict[
     if any(k in ql for k in ("магист", "зарубеж", "за границ", "иностран", "болаш", "nazarbayev")):
         p32 = [i for i, p in enumerate(PUNKTS) if str(p.get("punkt_num","")).strip()=="32"]
         must_have = p32 + must_have
-
+  # ── ДОБАВИТЬ: внешние must-have по политике ──
+    if must_have_pairs:
+        for pn, sp in must_have_pairs:
+            for i, p in enumerate(PUNKTS):
+                if str(p.get("punkt_num","")).strip() == pn and (not sp or str(p.get("subpunkt_num","")).strip() == sp):
+                    # вставим в начало must_have, если такого индекса ещё нет
+                    if i not in must_have:
+                        must_have.insert(0, i)
     top_idx: List[int] = []
     for i in must_have + ranked:
         if i not in top_idx:
@@ -1591,7 +1777,6 @@ async def handle_webhook(request: web.Request) -> web.Response:
                            "Either pass the header through or unset TELEGRAM_WEBHOOK_SECRET.")
             return web.Response(status=403, text="forbidden")
 
-
     data = await request.json()
     logger.info("Update keys: %s", list(data.keys()))
 
@@ -1652,16 +1837,23 @@ async def handle_webhook(request: web.Request) -> web.Response:
 
     async with lock:
         try:
-            punkts = await run_blocking(rag_search, text)
+            # 0) Интент
+            intent_info = classify_question(text)
+
+            # 1) must-have по политике в retrieve
+            policy_pairs = policy_get_must_have_pairs(intent_info)
+            punkts = await run_blocking(rag_search, text, must_have_pairs=policy_pairs)
+
+            # 2) LLM
             data_struct = await run_blocking(ask_llm, text, punkts)
 
-            # Контекст для подстраховки short_answer
-            context_text = build_context_snippets(punkts)
+            # 3) Политика: минимум цитат и краткий ответ
+            data_struct = ensure_min_citations_policy(text, data_struct, punkts, intent_info)
+            data_struct = enforce_short_answer_policy(text, data_struct, punkts, intent_info)
 
-            # Сначала гарантируем минимум цитат → затем шлифуем short_answer → затем reasoned_answer
-            data_struct = ensure_min_citations(text, data_struct, punkts)
-            data_struct = enforce_short_answer(text, data_struct, context_text)
-            data_struct = enforce_reasoned_answer(text, data_struct, punkts)
+            # 4) Буллеты только для вопросов про категорию
+            if intent_info.get("intent") == "category_requirements":
+                data_struct = enforce_reasoned_answer(text, data_struct, punkts)
 
             # HTML
             short_html = render_short_html(text, data_struct)
