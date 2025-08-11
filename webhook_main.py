@@ -264,6 +264,51 @@ def build_procedure_tail_if_p10(punkts: List[Dict[str,Any]]) -> str:
         if str(p.get("punkt_num","")).strip() == "10":
             return " (этапы: заявление → портфолио → ОЗП → обобщение → решение комиссии)"
     return ""
+def extract_threshold_percent_from_p39_for_category(punkts: List[Dict[str,Any]], category_key: Optional[str]) -> Optional[str]:
+    """
+    Пытаемся вытащить % из п.39 именно для указанной категории (мастер/эксперт/…).
+    Логика:
+      1) Находим п.39.
+      2) Если задана категория, ищем в пределах предложений/фрагментов, где встречается корень категории.
+      3) Берём ближайший % к таким упоминаниям.
+      4) Фоллбек — None (пусть сработает общий экстрактор/дефолт).
+    """
+    if not category_key:
+        return None
+
+    target_syns = CATEGORY_SYNONYMS.get(category_key, ())
+    if not target_syns:
+        return None
+
+    text39 = None
+    for p in punkts:
+        if str(p.get("punkt_num","")).strip() == "39":
+            text39 = (p.get("text") or "")
+            break
+    if not text39:
+        return None
+
+    tl = text39.lower().replace("ё","е")
+
+    # Режем на предложения и крупные фрагменты
+    parts = re.split(r"(?:\n+|[.;]\s+)", tl)
+    # собираем кандидаты, где есть синонимы категории
+    cand = [s for s in parts if any(syn in s for syn in target_syns)]
+    if not cand:
+        # иногда категория упомянута только как «педагог-мастер»
+        base = tl
+        cand = [base] if any(syn in base for syn in target_syns) else []
+
+    # достаём проценты из кандидатов
+    get_perc = re.compile(r"(\d{1,3})\s*%")
+    found: List[int] = []
+    for s in cand:
+        found += [int(x) for x in get_perc.findall(s)]
+    if found:
+        # берём максимальный из привязанных к категории — безопаснее, если в одном фрагменте несколько чисел
+        return f"{max(found)}%"
+
+    return None
 
 # ─────────── Policy-aware helpers для цитат и краткого ответа ───────────
 def ensure_min_citations_policy(question: str,
@@ -324,7 +369,12 @@ def enforce_short_answer_policy(question: str,
     facts = {
         "cat_human": human,
         "cat_sp": sp,
-        "threshold_percent": extract_threshold_percent_from_p39(punkts) or "80%",
+        "threshold_percent": (
+            extract_threshold_percent_from_p39_for_category(punkts, category_key)
+            or extract_threshold_percent_from_p39(punkts)
+            or "80%"
+        ),
+
         "procedure_tail": build_procedure_tail_if_p10(punkts)
     }
 
@@ -1496,8 +1546,15 @@ def filter_citations_by_question(
                 keys10 = ("заявлен", "портфолио", "озп", "обобщен", "комисси")
                 c["quote"] = _collapse_repeats(_crop_around(base_full, keys10, width=QUOTE_WIDTH_DEFAULT))
             elif pn == "39":
-                keys39 = ("озп", "порог", "80")
+                # Пытаемся вырезать цитату вокруг фактического процента для заданной категории
+                perc = extract_threshold_percent_from_p39_for_category(punkts, target) \
+                       or extract_threshold_percent_from_p39(punkts)
+                if perc:
+                    keys39 = (perc,)
+                else:
+                    keys39 = ("озп", "порог", "%")
                 c["quote"] = _collapse_repeats(_crop_around(base_full, keys39, width=QUOTE_WIDTH_DEFAULT))
+
             else:
                 c["quote"] = _collapse_repeats(_crop_around(base_full, tuple(), width=QUOTE_WIDTH_DEFAULT))
 
@@ -1717,11 +1774,9 @@ def render_detailed_html(question: str, data: Dict[str, Any], punkts: List[Dict[
 
 def tg_set_webhook(full_url: str, secret: Optional[str]) -> None:
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook"
-    payload = {"url": full_url}
+    payload = {"url": full_url, "allowed_updates": ["message", "callback_query"], "drop_pending_updates": True}
     if secret:
         payload["secret_token"] = secret
-    payload["allowed_updates"] = ["message", "callback_query"]
-
     r = requests.post(url, json=payload, timeout=15)
     if not r.ok:
         logger.error("setWebhook failed: %s %s", r.status_code, r.text)
@@ -1834,7 +1889,6 @@ async def handle_webhook(request: web.Request) -> web.Response:
     if lock.locked():
         await run_blocking(tg_send_message, chat_id, "Уже обрабатываю ваш предыдущий вопрос, одну секунду 🙌")
         return web.Response(text="ok")
-
     async with lock:
         try:
             # 0) Интент
@@ -1888,6 +1942,8 @@ async def handle_webhook(request: web.Request) -> web.Response:
             await run_blocking(tg_send_message, chat_id, "Произошла ошибка при обработке запроса. Попробуйте позже.")
 
     return web.Response(text="ok")
+
+   
 
 # ─────────────────────────── main() ─────────────────────────────
 # в main():
