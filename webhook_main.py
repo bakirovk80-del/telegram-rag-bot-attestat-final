@@ -405,7 +405,7 @@ def policy_get_must_have_pairs(intent_info: Dict[str,Any]) -> List[Tuple[str,str
 KW_OZP_TERMS = ("озп", "оценка знаний педагогов", "порог", "тестирован", "80 %", "80%")
 
 # лимиты длины цитат
-QUOTE_WIDTH_DEFAULT = int(os.environ.get("QUOTE_WIDTH_DEFAULT", "180"))
+QUOTE_WIDTH_DEFAULT = int(os.environ.get("QUOTE_WIDTH_DEFAULT", "220"))
 QUOTE_WIDTH_LONG    = int(os.environ.get("QUOTE_WIDTH_LONG", "600"))
 
 
@@ -1429,7 +1429,7 @@ def _ensure_category_citation(question: str,
     return citations
 
 # ── Фильтрация цитат по ключевым словам из вопроса ──
-def filter_citations_by_question(
+ddef filter_citations_by_question(
     question: str,
     citations: List[Dict[str, Any]],
     punkts: List[Dict[str, Any]]
@@ -1457,6 +1457,8 @@ def filter_citations_by_question(
     # helper
     def _crop_around(text_full: str, keys: Tuple[str, ...], width: int = QUOTE_WIDTH_DEFAULT) -> str:
         tf = re.sub(r"[ \t]+", " ", text_full or "").strip()
+        # NBSP → обычный пробел до понижения регистра
+        tf = tf.replace("\u00A0", " ")
         tl = tf.lower().replace("ё", "е")
         pos = -1
         for k in keys:
@@ -1473,17 +1475,18 @@ def filter_citations_by_question(
         return snippet[:width] + ("…" if len(snippet) > width else "")
 
     # remove 3/41
-    clean = [c for c in citations if str(c.get("punkt_num","")) not in {"3","41"}]
-    if not clean: clean = citations[:]
+    clean = [c for c in citations if str(c.get("punkt_num","")).strip() not in {"3","41"}]
+    if not clean:
+        clean = citations[:]
 
     # foreign?
     if any(k in ql for k in ("магист","зарубеж","за границ","иностран","болаш","bolash","nazarbayev")):
-        p32 = [c for c in clean if str(c.get("punkt_num","")).strip()=="32"]
-        rest = [c for c in clean if str(c.get("punkt_num","")).strip()!="32"]
+        p32 = [c for c in clean if str(c.get("punkt_num","")).strip() == "32"]
+        rest = [c for c in clean if str(c.get("punkt_num","")).strip() != "32"]
         pref_terms = ("зарубеж","болаш","nazarbayev","без прохождения")
-        def _rel(c): 
+        def _rel(c):
             key = (str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip())
-            return any(t in by_key.get(key,"") for t in pref_terms)
+            return any(t in by_key.get(key, "") for t in pref_terms)
         ordered = p32 + sorted(rest, key=lambda c: (not _rel(c)))
         out = (ordered[:2] or clean[:2])
         for c in out:
@@ -1497,36 +1500,35 @@ def filter_citations_by_question(
     target = None
     for key, syns in CATEGORY_SYNONYMS.items():
         if any(s in ql for s in syns):
-            target = key; break
+            target = key
+            break
 
     if target:
         # ensure p.10 and p.39 exist in context
-        def _exists_p(pn: str) -> Optional[Tuple[str,str,str]]:
+        def _exists_p(pn: str) -> Optional[Tuple[str, str, str]]:
             for (kpn, ksp), t in by_key_full.items():
                 if kpn == pn:
                     return (pn, ksp, t)
             return None
 
-        # sort: p.5.canon -> other p.5 -> 10 -> 39 -> rest
-                # сортировка: п.5.канон -> прочие п.5 -> 10 -> 39 -> остальное
+        # сортировка: п.5.канон -> прочие п.5 -> 10 -> 39 -> остальное
         canon_sp = CAT_CANON.get(target, ("",""))[1]
         def _ord(c):
             pn = str(c.get("punkt_num","")).strip()
             sp = str(c.get("subpunkt_num","")).strip()
-            if pn=="5" and sp==canon_sp: return (0,0)
-            if pn=="5": return (1,0)
-            if pn=="10": return (2,0)
-            if pn=="39": return (3,0)
-            return (4,0)
+            if pn == "5" and sp == canon_sp: return (0, 0)
+            if pn == "5": return (1, 0)
+            if pn == "10": return (2, 0)
+            if pn == "39": return (3, 0)
+            return (4, 0)
 
         clean.sort(key=_ord)
         out = clean[:3]
 
         # если 10/39 отсутствуют, но есть в контексте — добавим
         have = {(str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip()) for c in out}
-        
         for pn in ("10","39"):
-            if not any(h[0]==pn for h in have):
+            if not any(h[0] == pn for h in have):
                 hit = _exists_p(pn)
                 if hit:
                     pn_, sp_, txt_ = hit
@@ -1538,6 +1540,7 @@ def filter_citations_by_question(
             base_full = by_key_full.get(key, "")
             if not base_full:
                 continue
+
             pn = key[0]
             if pn == "5":
                 width = QUOTE_WIDTH_LONG
@@ -1546,19 +1549,20 @@ def filter_citations_by_question(
                 keys10 = ("заявлен", "портфолио", "озп", "обобщен", "комисси")
                 c["quote"] = _collapse_repeats(_crop_around(base_full, keys10, width=QUOTE_WIDTH_DEFAULT))
             elif pn == "39":
-                # Пытаемся вырезать цитату вокруг фактического процента для заданной категории
-                perc = extract_threshold_percent_from_p39_for_category(punkts, target) \
-                       or extract_threshold_percent_from_p39(punkts)
+                perc = (extract_threshold_percent_from_p39_for_category(punkts, target)
+                        or extract_threshold_percent_from_p39(punkts))
                 if perc:
-                    keys39 = (perc,)
+                    # perc вида '90%'; добавим варианты '90 %' и '90\\u00A0%'
+                    num = re.search(r"\d{1,3}", perc).group(0)
+                    keys39 = (perc, f"{num} %", f"{num}\u00A0%")
                 else:
                     keys39 = ("озп", "порог", "%")
                 c["quote"] = _collapse_repeats(_crop_around(base_full, keys39, width=QUOTE_WIDTH_DEFAULT))
-
             else:
                 c["quote"] = _collapse_repeats(_crop_around(base_full, tuple(), width=QUOTE_WIDTH_DEFAULT))
 
         return out[:3]
+
     # default: просто до 3 цитат и аккуратная нарезка
     out = clean[:3]
     for c in out:
@@ -1601,7 +1605,7 @@ def enforce_reasoned_answer(question: str, data: Dict[str, Any], punkts: List[Di
         t = _collapse_repeats(text)
         parts = re.split(r"(?:\n+|•|—|\u2014|;|\.\s+|\d+\)|\d+\.)", t)
         parts = [re.sub(r"[ \t]+"," ", s).strip(" -—•.;") for s in parts]
-        parts = [s for s in parts if 20 <= len(s) <= 220]
+        parts = [s for s in parts if 20 <= len(s) <= 240]
         uniq, seen = [], set()
         for s in parts:
             key = s.lower()[:80]
