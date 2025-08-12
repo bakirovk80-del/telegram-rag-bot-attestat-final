@@ -127,8 +127,8 @@ GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip() 
 
 # Скоринговые веса
 W_EMB = 1.0
-W_BM25 = 0.75
-W_MAP = 1.25
+W_BM25 = 1.0
+W_MAP = 1.0
 W_REGEX = 0.15
 
 # категории (усиливаем вклад)
@@ -164,9 +164,10 @@ CATEGORY_LABEL = {
 # ─────────────────────── Intent + Policy (универсальный слой) ───────────────────────
 
 INTENT_KEYWORDS = {
-    "threshold": ("порог", "порогов", "пороговы", "балл", "баллы", "сколько баллов", "озп", "оценка знаний", "тест", "тестирован", "процент", "80%"),
+    "threshold": ("порог", "порогов", "пороговы", "балл", "баллы", "сколько баллов", "озп", "оценка знаний", "тест", "тестирован", "процент", "80%", "минимальный процент", "минимальный балл", "сколько процентов", "сколько баллов", "надо набрать"),
     "procedure": ("как сдать", "как проходит", "этап", "этапы", "заявлен", "подать", "портфолио", "комисси", "обобщен"),
     "exemption_foreign": ("магист", "за рубеж", "зарубеж", "за границ", "иностран", "болаш", "bolash", "nazarbayev"),
+    "exemption_retirement": ("пенсионер", "пенсионного возраста", "до пенсии", "осталось до пенсии", "работающий пенсионер"),
 }
 
 def _detect_category_key(q: str) -> Optional[str]:
@@ -180,6 +181,8 @@ def classify_question(q: str) -> Dict[str, Any]:
     ql = (q or "").lower().replace("ё","е")
     cat = _detect_category_key(ql)
     # приоритет: порог → льготы зарубеж → требования/категория → процедура → general
+    if any(k in ql for k in INTENT_KEYWORDS["exemption_retirement"]):
+        return {"intent": "exemption_retirement", "category": None, "confidence": 0.9}
     if any(k in ql for k in INTENT_KEYWORDS["threshold"]):
         return {"intent": "threshold", "category": cat, "confidence": 0.9}
     if any(k in ql for k in INTENT_KEYWORDS["exemption_foreign"]):
@@ -217,9 +220,15 @@ POLICIES = {
     },
     "general": {
         "primary": [],
-        "secondary": [("10",""), ("39","")],
+        "secondary": [("10","")],  # либо вообще []
         "max_citations": 3,
         "short_template": "{fallback_short}"
+    },
+    "exemption_retirement": {
+        "primary":   [("30","")],        # освобождение за ≤4 года до пенсии
+        "secondary": [("57","")],        # порядок аттестации для работающих пенсионеров
+        "max_citations": 3,
+        "short_template": "Зависит: если до пенсии ≤ 4 лет — освобождение (п.30); если уже пенсионер и работаете — аттестация по п.57."
     }
 }
 
@@ -829,9 +838,13 @@ def rag_search(q: str, top_k_stage1: int = 120, final_k: int = 45,
             add = [i for i, p in enumerate(PUNKTS) if str(p.get("punkt_num","")).strip()==wanted]
             must_have.extend(add)
 
-    if any(k in ql for k in ("магист", "зарубеж", "за границ", "иностран", "болаш", "nazarbayev")):
+    
+    foreign_generic = any(k in ql for k in ("магист", "зарубеж", "за границ", "иностран"))
+    bolashak_explicit = any(k in ql for k in ("болаш", "nazarbayev", "перечень рекомендованных"))
+    if bolashak_explicit:
         p32 = [i for i, p in enumerate(PUNKTS) if str(p.get("punkt_num","")).strip()=="32"]
         must_have = p32 + must_have
+
   # ── ДОБАВИТЬ: внешние must-have по политике ──
     if must_have_pairs:
         for pn, sp in must_have_pairs:
@@ -1457,7 +1470,6 @@ def filter_citations_by_question(
     # helper — обрезка вокруг ключевых слов с аккуратными границами
     def _crop_around(text_full: str, keys: Tuple[str, ...], width: int = QUOTE_WIDTH_DEFAULT) -> str:
         tf = re.sub(r"[ \t]+", " ", text_full or "").strip()
-        # NBSP → обычный пробел до понижения регистра
         tf = tf.replace("\u00A0", " ")
         tl = tf.lower().replace("ё", "е")
         pos = -1
@@ -1472,7 +1484,11 @@ def filter_citations_by_question(
         while start > 0 and tf[start] not in " .,;:!?()[]{}«»": start -= 1
         while end < len(tf) and tf[end - 1] not in " .,;:!?()[]{}«»": end += 1
         snippet = tf[start:end].strip()
+        # вот эти две строки — новое:
+        snippet = snippet.lstrip(" ;,.:—-–•")
+        snippet = snippet.rstrip(" ,;:")
         return snippet[:width] + ("…" if len(snippet) > width else "")
+  
 
     # remove 3/41
     clean = [c for c in citations if str(c.get("punkt_num","")).strip() not in {"3","41"}]
@@ -1556,7 +1572,7 @@ def filter_citations_by_question(
                     num = re.search(r"\d{1,3}", perc).group(0)
                     keys39 = (perc, f"{num} %", f"{num}\u00A0%")
                 else:
-                    keys39 = ("озп", "порог", "%")
+                    keys39 = ()
                 c["quote"] = _collapse_repeats(_crop_around(base_full, keys39, width=QUOTE_WIDTH_DEFAULT))
             else:
                 c["quote"] = _collapse_repeats(_crop_around(base_full, tuple(), width=QUOTE_WIDTH_DEFAULT))
