@@ -257,6 +257,7 @@ POLICIES = {
     )
 
     },
+}
 def build_short_answer(policy: dict | None, ctx: dict, fallback_short: str) -> str:
     """
     Если у политики есть свой short_template — используем только его.
