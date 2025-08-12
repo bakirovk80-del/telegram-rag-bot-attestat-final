@@ -2030,33 +2030,37 @@ async def handle_webhook(request: web.Request) -> web.Response:
     if lock.locked():
         await run_blocking(tg_send_message, chat_id, "Уже обрабатываю ваш предыдущий вопрос, одну секунду 🙌")
         return web.Response(text="ok")
+        # Пер-чатовая блокировка
+    lock = LOCKS.setdefault(int(chat_id), asyncio.Lock())
+    if lock.locked():
+        await run_blocking(tg_send_message, chat_id, "Уже обрабатываю ваш предыдущий вопрос, одну секунду 🙌")
+        return web.Response(text="ok")
+
     async with lock:
-    try:
-        # 0) Интент
-        intent_info = classify_question(text)
-        logger.info("intent=%s cat=%s", intent_info.get("intent"), intent_info.get("category"))
+        try:
+            # 0) Интент
+            intent_info = classify_question(text)
+            logger.info("intent=%s cat=%s", intent_info.get("intent"), intent_info.get("category"))
 
-        # 1) must-have по политике в retrieve (ОДИН раз)
-        policy_pairs = policy_get_must_have_pairs(intent_info)
-        logger.info("policy_pairs=%s", policy_pairs)
-        punkts = await run_blocking(rag_search, text, must_have_pairs=policy_pairs)
-        logger.info("top_punkts=%s", [(p.get('punkt_num'), p.get('subpunkt_num')) for p in punkts[:10]])
+            # 1) must-have по политике в retrieve (ОДИН раз)
+            policy_pairs = policy_get_must_have_pairs(intent_info)
+            logger.info("policy_pairs=%s", policy_pairs)
+            punkts = await run_blocking(rag_search, text, must_have_pairs=policy_pairs)
+            logger.info("top_punkts=%s", [(p.get('punkt_num'), p.get('subpunkt_num')) for p in punkts[:10]])
 
-        # 2) LLM
-        data_struct = await run_blocking(ask_llm, text, punkts)
+            # 2) LLM
+            data_struct = await run_blocking(ask_llm, text, punkts)
 
-        # 3) Политика: минимум цитат и краткий ответ
-        data_struct = ensure_min_citations_policy(text, data_struct, punkts, intent_info)
-        data_struct = enforce_short_answer_policy(text, data_struct, punkts, intent_info)
+            # 3) Политика: минимум цитат и краткий ответ
+            data_struct = ensure_min_citations_policy(text, data_struct, punkts, intent_info)
+            data_struct = enforce_short_answer_policy(text, data_struct, punkts, intent_info)
 
-        # 4) Буллеты — только для категории
-        if intent_info.get("intent") == "category_requirements":
-            data_struct = enforce_reasoned_answer(text, data_struct, punkts)
+            # 4) Буллеты — только для категории
+            if intent_info.get("intent") == "category_requirements":
+                data_struct = enforce_reasoned_answer(text, data_struct, punkts)
 
-        # (опционально) убери это, если функции нет:
-        # data_struct = enforce_policy_reasoned_answer(text, data_struct, intent_info)
-
-
+            # 4a) Выравнивание «подробного ответа» по политике (пенсионеры/зарубеж)
+            data_struct = enforce_policy_reasoned_answer(text, data_struct, intent_info)
 
             # HTML
             short_html = render_short_html(text, data_struct)
@@ -2078,11 +2082,10 @@ async def handle_webhook(request: web.Request) -> web.Response:
                     "short_html": short_html,
                     "detailed_html": detailed_html,
                 }
-
-            if len(LAST_RESPONSES) > 200:
-                FIRST = next(iter(LAST_RESPONSES))
-                if FIRST != key:
-                    LAST_RESPONSES.pop(FIRST, None)
+                if len(LAST_RESPONSES) > 200:
+                    FIRST = next(iter(LAST_RESPONSES))
+                    if FIRST != key:
+                        LAST_RESPONSES.pop(FIRST, None)
 
             await run_blocking(log_to_sheet_safe, chat_id, text, data_struct.get("short_answer", ""))
 
@@ -2091,9 +2094,6 @@ async def handle_webhook(request: web.Request) -> web.Response:
             await run_blocking(tg_send_message, chat_id, "Произошла ошибка при обработке запроса. Попробуйте позже.")
 
     return web.Response(text="ok")
-
-   
-
 # ─────────────────────────── main() ─────────────────────────────
 # в main():
 
