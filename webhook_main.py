@@ -453,6 +453,7 @@ def enforce_short_answer_policy(question: str,
     return data
 
 
+
 def policy_get_must_have_pairs(intent_info: Dict[str,Any]) -> List[Tuple[str,str]]:
     intent = intent_info.get("intent","general")
     category_key = intent_info.get("category")
@@ -573,10 +574,10 @@ LOCKS: Dict[int, asyncio.Lock] = {}
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 def load_punkts(path: str) -> List[Dict[str, Any]]:
+    import re
     with open(path, "r", encoding="utf-8") as f:
         arr = json.load(f)
     assert isinstance(arr, list) and len(arr) > 0, "PUNKTS JSON must be a non-empty list"
-    # Нормализация ключей (на всякий случай)
     for p in arr:
         p.setdefault("id", str(uuid.uuid4()))
         p.setdefault("punkt_num", "")
@@ -584,7 +585,12 @@ def load_punkts(path: str) -> List[Dict[str, Any]]:
         p.setdefault("text", "")
         p.setdefault("chapter", "")
         p.setdefault("paragraph", "")
+        # нормализация «5.3)» → «5» и «3»
+        p["punkt_num"] = re.sub(r"\D+", "", str(p["punkt_num"]))
+        p["subpunkt_num"] = re.sub(r"\D+", "", str(p["subpunkt_num"]))
     return arr
+
+
 
 PUNKTS: List[Dict[str, Any]] = load_punkts(PUNKTS_PATH)
 
@@ -1560,7 +1566,9 @@ def filter_citations_by_question(
     if any(k in ql for k in ("магист","зарубеж","за границ","иностран","болаш","bolash","nazarbayev")):
         p32 = [c for c in clean if str(c.get("punkt_num","")).strip() == "32"]
         rest = [c for c in clean if str(c.get("punkt_num","")).strip() != "32"]
-        pref_terms = ("зарубеж","болаш","nazarbayev","без прохождения")
+        pref_terms = ("учен", "учёная", "степен", "phd", "кандид", "доктор",
+              "перечень рекомендованных", "nazarbayev", "болаш",
+              "без прохождения")
         def _rel(c):
             key = (str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip())
             return any(t in by_key.get(key, "") for t in pref_terms)
@@ -1595,7 +1603,9 @@ def filter_citations_by_question(
 
     if target:
         # ensure p.10 and p.39 exist in context
-        def _exists_p(pn: string) -> Optional[Tuple[str, str, str]]:  # type: ignore
+        def _exists_p(pn: str) -> Optional[Tuple[str, str, str]]:
+
+
             for (kpn, ksp), t in by_key_full.items():
                 if kpn == pn:
                     return (pn, ksp, t)
@@ -1914,8 +1924,7 @@ def render_detailed_html(question: str, data: Dict[str, Any], punkts: List[Dict[
             lines.append(f"• {head}")
 
     return "\n".join(lines).strip()
-# Интенты, где «Связанные пункты» лучше скрыть, чтобы не шуметь
-INTENTS_HIDE_RELATED = {"threshold", "exemption_foreign", "exemption_retirement"}
+
 
 def render_related(intent: str, related_items: list[str]) -> str:
     if intent in INTENTS_HIDE_RELATED:
@@ -2043,9 +2052,7 @@ async def handle_webhook(request: web.Request) -> web.Response:
         return web.Response(text="ok")
         # Пер-чатовая блокировка
     lock = LOCKS.setdefault(int(chat_id), asyncio.Lock())
-    if lock.locked():
-        await run_blocking(tg_send_message, chat_id, "Уже обрабатываю ваш предыдущий вопрос, одну секунду 🙌")
-        return web.Response(text="ok")
+   
 
     async with lock:
         try:
