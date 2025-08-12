@@ -405,7 +405,7 @@ def policy_get_must_have_pairs(intent_info: Dict[str,Any]) -> List[Tuple[str,str
 KW_OZP_TERMS = ("озп", "оценка знаний педагогов", "порог", "тестирован", "80 %", "80%")
 
 # лимиты длины цитат
-QUOTE_WIDTH_DEFAULT = int(os.environ.get("QUOTE_WIDTH_DEFAULT", "220"))
+QUOTE_WIDTH_DEFAULT = int(os.environ.get("QUOTE_WIDTH_DEFAULT", "180"))
 QUOTE_WIDTH_LONG    = int(os.environ.get("QUOTE_WIDTH_LONG", "600"))
 
 
@@ -1454,7 +1454,7 @@ def filter_citations_by_question(
     }
     by_key = {k: v.lower().replace("ё","е") for k, v in by_key_full.items()}
 
-    # helper
+    # helper — обрезка вокруг ключевых слов с аккуратными границами
     def _crop_around(text_full: str, keys: Tuple[str, ...], width: int = QUOTE_WIDTH_DEFAULT) -> str:
         tf = re.sub(r"[ \t]+", " ", text_full or "").strip()
         # NBSP → обычный пробел до понижения регистра
@@ -1534,7 +1534,7 @@ def filter_citations_by_question(
                     pn_, sp_, txt_ = hit
                     out.append({"punkt_num": pn_, "subpunkt_num": sp_, "quote": ""})
 
-        # финальное подрезание по типу пункта
+        # финальная нарезка по типам пунктов
         for c in out:
             key = (str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip())
             base_full = by_key_full.get(key, "")
@@ -1552,7 +1552,7 @@ def filter_citations_by_question(
                 perc = (extract_threshold_percent_from_p39_for_category(punkts, target)
                         or extract_threshold_percent_from_p39(punkts))
                 if perc:
-                    # perc вида '90%'; добавим варианты '90 %' и '90\\u00A0%'
+                    # perc вида '90%'; добавим варианты '90 %' и '90\u00A0%'
                     num = re.search(r"\d{1,3}", perc).group(0)
                     keys39 = (perc, f"{num} %", f"{num}\u00A0%")
                 else:
@@ -1571,7 +1571,6 @@ def filter_citations_by_question(
         if base_full:
             c["quote"] = _collapse_repeats(_crop_around(base_full, tuple(), width=QUOTE_WIDTH_DEFAULT))
     return out
-
 def enforce_reasoned_answer(question: str, data: Dict[str, Any], punkts: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Для вопросов про категорию:
