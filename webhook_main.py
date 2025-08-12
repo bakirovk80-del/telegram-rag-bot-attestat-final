@@ -163,18 +163,27 @@ CATEGORY_LABEL = {
 
 # ─────────────────────── Intent + Policy (универсальный слой) ───────────────────────
 
+# ─────────────────────── Intent + Policy (универсальный слой) ───────────────────────
+
 INTENT_KEYWORDS = {
-    "threshold": ("порог", "порогов", "пороговы", "балл", "баллы", "сколько баллов", "озп", "оценка знаний", "тест", "тестирован", "процент", "80%", "минимальный процент", "минимальный балл", "сколько процентов", "сколько баллов", "надо набрать"),
+    "threshold": (
+        "порог", "порогов", "пороговы",
+        "балл", "баллы", "сколько баллов",
+        "озп", "оценка знаний", "тест", "тестирован",
+        "процент", "80%", "минимальный процент", "минимальный балл",
+        "сколько процентов", "сколько баллов", "надо набрать"
+    ),
     "procedure": ("как сдать", "как проходит", "этап", "этапы", "заявлен", "подать", "портфолио", "комисси", "обобщен"),
+    # расширили foreign, чтобы ловить «Болашак/NU/PhD/докторантура»
     "exemption_foreign": (
-    "болаш", "bolash",
-    "nazarbayev", "nazarbayev university",
-    "перечень рекомендованных", "перечень организаций"
-),
-
+        "болаш", "bolash",
+        "nazarbayev", "nazarbayev university",
+        "перечень рекомендованных", "перечень организаций",
+        "зарубеж", "за границ", "иностран",
+        "магистратур", "докторантур", "phd",
+        "кандидат наук", "доктор наук", "ученая степень", "учёная степень"
+    ),
     "exemption_retirement": ("пенсионер", "работающий пенсионер", "пенсионного возраста", "до пенсии", "осталось до пенсии"),
-
-    
 }
 
 def _detect_category_key(q: str) -> Optional[str]:
@@ -187,19 +196,18 @@ def _detect_category_key(q: str) -> Optional[str]:
 def classify_question(q: str) -> Dict[str, Any]:
     ql = (q or "").lower().replace("ё","е")
     cat = _detect_category_key(ql)
-    # приоритет: пенсионеры → порог → льготы зарубеж → категория → процедура → general
+    # ПЕРЕПРИОРИТЕТ: пенсионеры → зарубеж/льгота → категория → порог → процедура → general
     if any(k in ql for k in INTENT_KEYWORDS["exemption_retirement"]):
         return {"intent": "exemption_retirement", "category": None, "confidence": 0.9}
-    if any(k in ql for k in INTENT_KEYWORDS["threshold"]):
-        return {"intent": "threshold", "category": cat, "confidence": 0.9}
     if any(k in ql for k in INTENT_KEYWORDS["exemption_foreign"]):
         return {"intent": "exemption_foreign", "category": None, "confidence": 0.9}
     if cat:
         return {"intent": "category_requirements", "category": cat, "confidence": 0.85}
+    if any(k in ql for k in INTENT_KEYWORDS["threshold"]):
+        return {"intent": "threshold", "category": cat, "confidence": 0.85}
     if any(k in ql for k in INTENT_KEYWORDS["procedure"]):
         return {"intent": "procedure", "category": None, "confidence": 0.75}
     return {"intent": "general", "category": None, "confidence": 0.5}
-
 
 POLICIES = {
     "threshold": {
@@ -1496,10 +1504,11 @@ def filter_citations_by_question(
     """
     Релевантность и порядок:
     — Зарубеж/магистратура: п.32 первым, максимум 1–2 цитаты.
-    — Категория: порядок — п.5.целевой → п.10 → п.39, до 3 цитат.
-      Если п.10/п.39 есть в контексте, но отсутствуют в цитатах — ДОБАВЛЯЕМ сюда.
-    — 3 и 41 выкидываем.
-    — Иначе: до 3 цитат.
+    — Пенсионеры: порядок — п.30 → п.57 → прочее (1–2 цитаты).
+    — Категория: порядок — п.5.канон → прочие п.5 → п.10 → п.39 (до 3 цитат)
+      и нарезка цитаты из п.5 строго вокруг целевой категории.
+    — Пункты 3 и 41 как «доказательство» — выкидываем.
+    — По умолчанию: до 3 цитат с аккуратной нарезкой.
     """
     import re
 
@@ -1507,6 +1516,7 @@ def filter_citations_by_question(
     if not citations:
         return citations
 
+    # Карта текстов для выданного контекста
     by_key_full = {
         (str(p.get("punkt_num","")).strip(), str(p.get("subpunkt_num","")).strip()): (p.get("text") or "")
         for p in punkts
@@ -1514,12 +1524,11 @@ def filter_citations_by_question(
     by_key = {k: v.lower().replace("ё","е") for k, v in by_key_full.items()}
 
     # helper — обрезка вокруг ключевых слов с аккуратными границами
-    def _crop_around(text_full: str, keys: Tuple[str, ...], width: int = QUOTE_WIDTH_DEFAULT) -> str:
-        tf = re.sub(r"[ \t]+", " ", text_full or "").strip()
-        tf = tf.replace("\u00A0", " ")
+    def _crop_around(text_full: str, keys, width: int = QUOTE_WIDTH_DEFAULT) -> str:
+        tf = re.sub(r"[ \t]+", " ", text_full or "").strip().replace("\u00A0", " ")
         tl = tf.lower().replace("ё", "е")
         pos = -1
-        for k in keys:
+        for k in keys or ():
             i = tl.find(k)
             if i != -1 and (pos == -1 or i < pos):
                 pos = i
@@ -1530,11 +1539,8 @@ def filter_citations_by_question(
         while start > 0 and tf[start] not in " .,;:!?()[]{}«»": start -= 1
         while end < len(tf) and tf[end - 1] not in " .,;:!?()[]{}«»": end += 1
         snippet = tf[start:end].strip()
-        # вот эти две строки — новое:
-        snippet = snippet.lstrip(" ;,.:—-–•")
-        snippet = snippet.rstrip(" ,;:")
+        snippet = snippet.lstrip(" ;,.:—-–•").rstrip(" ,;:")
         return snippet[:width] + ("…" if len(snippet) > width else "")
-  
 
     # remove 3/41
     clean = [c for c in citations if str(c.get("punkt_num","")).strip() not in {"3","41"}]
@@ -1555,9 +1561,10 @@ def filter_citations_by_question(
             key = (str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip())
             base_full = by_key_full.get(key, "")
             if base_full:
-                c["quote"] = _crop_around(base_full, pref_terms, width=QUOTE_WIDTH_DEFAULT)
+                c["quote"] = _collapse_repeats(_crop_around(base_full, pref_terms, width=QUOTE_WIDTH_DEFAULT))
         return out
-        # retirement?
+
+    # retirement?
     if any(k in ql for k in ("пенсион", "работающий пенсионер", "до пенсии")):
         p30 = [c for c in clean if str(c.get("punkt_num","")).strip() == "30"]
         p57 = [c for c in clean if str(c.get("punkt_num","")).strip() == "57"]
@@ -1567,8 +1574,7 @@ def filter_citations_by_question(
             key = (str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip())
             base_full = by_key_full.get(key, "")
             if base_full:
-                # короткий фрагмент вокруг ключевых слов
-                c["quote"] = _crop_around(base_full, ("пенсион", "освобожда", "обобщен", "озп"), width=QUOTE_WIDTH_DEFAULT)
+                c["quote"] = _collapse_repeats(_crop_around(base_full, ("пенсион","освобожда","обобщен","озп"), width=QUOTE_WIDTH_DEFAULT))
         return out
 
     # category?
@@ -1580,7 +1586,7 @@ def filter_citations_by_question(
 
     if target:
         # ensure p.10 and p.39 exist in context
-        def _exists_p(pn: str) -> Optional[Tuple[str, str, str]]:
+        def _exists_p(pn: string) -> Optional[Tuple[str, str, str]]:  # type: ignore
             for (kpn, ksp), t in by_key_full.items():
                 if kpn == pn:
                     return (pn, ksp, t)
@@ -1609,17 +1615,32 @@ def filter_citations_by_question(
                     pn_, sp_, txt_ = hit
                     out.append({"punkt_num": pn_, "subpunkt_num": sp_, "quote": ""})
 
+        # ключи для точного скоупа внутри п.5.x
+        human = CATEGORY_LABEL.get(target, target)
+        cat_keys = tuple(set(CATEGORY_SYNONYMS.get(target, ())) | {
+            f"педагог-{target}", f"педагог {target}",
+            f"педагог-{human}", f"педагог {human}", human
+        })
+
         # финальная нарезка по типам пунктов
         for c in out:
             key = (str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip())
             base_full = by_key_full.get(key, "")
             if not base_full:
                 continue
-
             pn = key[0]
             if pn == "5":
                 width = QUOTE_WIDTH_LONG
-                c["quote"] = _collapse_repeats(_crop_around(base_full, (target,), width=width))
+                snippet = _crop_around(base_full, cat_keys, width=width)
+                tl = snippet.lower().replace("ё","е")
+                # если всё ещё нет упоминания — возьмём первое предложение, где встречается ключ
+                if not any(k.replace("ё","е") in tl for k in cat_keys):
+                    for sent in re.split(r"(?<=[\.\!\?])\s+", base_full):
+                        sl = (sent or "").lower().replace("ё","е")
+                        if any(k in sl for k in cat_keys):
+                            snippet = sent[:width] + ("…" if len(sent) > width else "")
+                            break
+                c["quote"] = _collapse_repeats(snippet)
             elif pn == "10":
                 keys10 = ("заявлен", "портфолио", "озп", "обобщен", "комисси")
                 c["quote"] = _collapse_repeats(_crop_around(base_full, keys10, width=QUOTE_WIDTH_DEFAULT))
@@ -1627,7 +1648,6 @@ def filter_citations_by_question(
                 perc = (extract_threshold_percent_from_p39_for_category(punkts, target)
                         or extract_threshold_percent_from_p39(punkts))
                 if perc:
-                    # perc вида '90%'; добавим варианты '90 %' и '90\u00A0%'
                     num = re.search(r"\d{1,3}", perc).group(0)
                     keys39 = (perc, f"{num} %", f"{num}\u00A0%")
                 else:
@@ -1646,6 +1666,7 @@ def filter_citations_by_question(
         if base_full:
             c["quote"] = _collapse_repeats(_crop_around(base_full, tuple(), width=QUOTE_WIDTH_DEFAULT))
     return out
+
 def enforce_reasoned_answer(question: str, data: Dict[str, Any], punkts: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Для вопросов про категорию:
@@ -1706,6 +1727,31 @@ def enforce_reasoned_answer(question: str, data: Dict[str, Any], punkts: List[Di
         data["reasoned_answer"] = "\n".join(lines)
     else:
         data["reasoned_answer"] = current + "\n\n" + "\n".join(lines)
+    return data
+# ── Вставить рядом с enforce_short_answer_policy/enforce_reasoned_answer ──
+def enforce_policy_reasoned_answer(question: str,
+                                   data: Dict[str,Any],
+                                   intent_info: Dict[str,Any]) -> Dict[str,Any]:
+    import re
+    intent = intent_info.get("intent","general")
+    policy = POLICIES.get(intent, {})
+    long_t = policy.get("long_template")
+    ra = (data.get("reasoned_answer") or "").strip()
+
+    # для льгот/пенсионеров убираем жесткие формулировки «обязан/обязательно»
+    if intent in {"exemption_foreign", "exemption_retirement"}:
+        ra = re.sub(r"\b(обязан|обязательно|должен|необходимо)\b",
+                    "применяется порядок по Правилам", ra, flags=re.I)
+
+    # если есть длинный шаблон — ставим его первым и считаем «истиной по умолчанию»
+    if long_t:
+        if len(ra) < 40:
+            data["reasoned_answer"] = long_t
+        else:
+            data["reasoned_answer"] = long_t + ("\n\n" + ra if ra else "")
+    else:
+        data["reasoned_answer"] = ra
+
     return data
 
 
@@ -1794,6 +1840,9 @@ def render_short_html(question: str, data: Dict[str, Any]) -> str:
         lines.append("<i>Нажмите кнопку ниже, чтобы увидеть подробное обоснование и цитаты.</i>")
     return "\n".join(lines)
 
+# Интенты, где «Связанные пункты» лучше скрыть, чтобы не шуметь
+INTENTS_HIDE_RELATED = {"threshold", "exemption_foreign", "exemption_retirement"}
+
 def render_detailed_html(question: str, data: Dict[str, Any], punkts: List[Dict[str, Any]]) -> str:
     sa = html.escape(data.get("short_answer", "")).strip()
     ra = html.escape(data.get("reasoned_answer", "")).strip()
@@ -1803,16 +1852,14 @@ def render_detailed_html(question: str, data: Dict[str, Any], punkts: List[Dict[
 
     citations = validate_citations(data.get("citations", []), punkts)
     citations = filter_citations_by_question(question, citations, punkts)
-    # не шумим «связанными пунктами» для порога/льгот/пенсионеров
+
     intent = classify_question(question).get("intent", "general")
 
-
-    # Авто-related: если в наборе пунктов контекста присутствуют 39 или 63.*, а в citations их нет — добавим в related
+    # related: только если не шумит под конкретный интент
     have_cit = {(str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip()) for c in citations}
     related = data.get("related", []) or []
+
     if intent not in INTENTS_HIDE_RELATED:
-        # Авто-related только если это уместно
-        have_cit = {(str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip()) for c in citations}
         def _exists(pn: str, sp: str = "") -> bool:
             for p in punkts:
                 if str(p.get("punkt_num","")).strip()==pn and (sp=="" or str(p.get("subpunkt_num","")).strip()==sp):
@@ -1821,13 +1868,17 @@ def render_detailed_html(question: str, data: Dict[str, Any], punkts: List[Dict[
         def _push(pn: str, sp: str = "") -> None:
             if (pn, sp) not in have_cit:
                 related.append({"punkt_num": pn, "subpunkt_num": sp})
+
+        # Добавим п.39, если был в контексте и его нет среди цитат
         if _exists("39"): _push("39","")
+
+        # И один первый подпункт п.63, если встречался в контексте
         for p in punkts:
             if str(p.get("punkt_num","")).strip()=="63":
                 _push("63", str(p.get("subpunkt_num","")).strip())
                 break
-    data["related"] = related
 
+    data["related"] = related
 
     lines: List[str] = []
     lines.append(f"<b>Вопрос:</b> {html.escape(question)}")
@@ -1841,8 +1892,7 @@ def render_detailed_html(question: str, data: Dict[str, Any], punkts: List[Dict[
             pn = c.get("punkt_num", "")
             sp = c.get("subpunkt_num", "")
             head = f"п. {pn}{('.' + sp) if sp else ''}".strip()
-            # ВАЖНО: НИКАКИХ <br>. Telegram HTML их не понимает.
-            qt = html.escape(c.get("quote", ""))  # переносы строк оставляем как \n
+            qt = html.escape(c.get("quote", ""))  # Telegram понимает \n, но не <br>
             lines.append(f"— <i>{head}</i>:\n{qt}")
     if related:
         lines.append("<b>Связанные пункты:</b>")
@@ -1851,6 +1901,7 @@ def render_detailed_html(question: str, data: Dict[str, Any], punkts: List[Dict[
             sp = html.escape(str(r.get("subpunkt_num", "")))
             head = f"п. {pn}{('.' + sp) if sp else ''}".strip()
             lines.append(f"• {head}")
+
     return "\n".join(lines).strip()
 # Интенты, где «Связанные пункты» лучше скрыть, чтобы не шуметь
 INTENTS_HIDE_RELATED = {"threshold", "exemption_foreign", "exemption_retirement"}
@@ -1983,6 +2034,11 @@ async def handle_webhook(request: web.Request) -> web.Response:
         try:
             # 0) Интент
             intent_info = classify_question(text)
+            logger.info("intent=%s cat=%s", intent_info.get("intent"), intent_info.get("category"))
+            policy_pairs = policy_get_must_have_pairs(intent_info)
+            logger.info("policy_pairs=%s", policy_pairs)
+            punkts = await run_blocking(rag_search, text, must_have_pairs=policy_pairs)
+            logger.info("top_punkts=%s", [(p.get('punkt_num'), p.get('subpunkt_num')) for p in punkts[:10]])
 
             # 1) must-have по политике в retrieve
             policy_pairs = policy_get_must_have_pairs(intent_info)
@@ -1995,9 +2051,13 @@ async def handle_webhook(request: web.Request) -> web.Response:
             data_struct = ensure_min_citations_policy(text, data_struct, punkts, intent_info)
             data_struct = enforce_short_answer_policy(text, data_struct, punkts, intent_info)
 
-            # 4) Буллеты только для вопросов про категорию
+            # 4) Буллеты — только для категории
             if intent_info.get("intent") == "category_requirements":
-                data_struct = enforce_reasoned_answer(text, data_struct, punkts)
+            data_struct = enforce_reasoned_answer(text, data_struct, punkts)
+
+            # 4a) NEW: выровнять «подробный ответ» по политике (пенсионеры/зарубеж)
+            data_struct = enforce_policy_reasoned_answer(text, data_struct, intent_info)
+
 
             # HTML
             short_html = render_short_html(text, data_struct)
