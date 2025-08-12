@@ -196,18 +196,27 @@ def _detect_category_key(q: str) -> Optional[str]:
 def classify_question(q: str) -> Dict[str, Any]:
     ql = (q or "").lower().replace("ё","е")
     cat = _detect_category_key(ql)
-    # ПЕРЕПРИОРИТЕТ: пенсионеры → зарубеж/льгота → категория → порог → процедура → general
+
+    # Приоритет: пенсионеры → зарубеж/льгота → ПОРОГ → категория → процедура → general
     if any(k in ql for k in INTENT_KEYWORDS["exemption_retirement"]):
         return {"intent": "exemption_retirement", "category": None, "confidence": 0.9}
+
     if any(k in ql for k in INTENT_KEYWORDS["exemption_foreign"]):
         return {"intent": "exemption_foreign", "category": None, "confidence": 0.9}
+
+    # ВАЖНО: пороговые вопросы ловим раньше категории,
+    # но саму категорию (если упомянута) передаем как context для шаблона threshold
+    if any(k in ql for k in INTENT_KEYWORDS["threshold"]):
+        return {"intent": "threshold", "category": cat, "confidence": 0.9}
+
     if cat:
         return {"intent": "category_requirements", "category": cat, "confidence": 0.85}
-    if any(k in ql for k in INTENT_KEYWORDS["threshold"]):
-        return {"intent": "threshold", "category": cat, "confidence": 0.85}
+
     if any(k in ql for k in INTENT_KEYWORDS["procedure"]):
         return {"intent": "procedure", "category": None, "confidence": 0.75}
+
     return {"intent": "general", "category": None, "confidence": 0.5}
+
 
 POLICIES = {
     "threshold": {
@@ -1741,7 +1750,9 @@ def enforce_policy_reasoned_answer(question: str,
     # для льгот/пенсионеров убираем жесткие формулировки «обязан/обязательно»
     if intent in {"exemption_foreign", "exemption_retirement"}:
         ra = re.sub(r"\b(обязан|обязательно|должен|необходимо)\b",
-                    "применяется порядок по Правилам", ra, flags=re.I)
+            "применяется порядок, предусмотренный Правилами",
+            ra, flags=re.I)
+
 
     # если есть длинный шаблон — ставим его первым и считаем «истиной по умолчанию»
     if long_t:
