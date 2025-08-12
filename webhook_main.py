@@ -167,7 +167,9 @@ INTENT_KEYWORDS = {
     "threshold": ("порог", "порогов", "пороговы", "балл", "баллы", "сколько баллов", "озп", "оценка знаний", "тест", "тестирован", "процент", "80%", "минимальный процент", "минимальный балл", "сколько процентов", "сколько баллов", "надо набрать"),
     "procedure": ("как сдать", "как проходит", "этап", "этапы", "заявлен", "подать", "портфолио", "комисси", "обобщен"),
     "exemption_foreign": ("магист", "за рубеж", "зарубеж", "за границ", "иностран", "болаш", "bolash", "nazarbayev"),
-    "exemption_retirement": ("пенсионер", "пенсионного возраста", "до пенсии", "осталось до пенсии", "работающий пенсионер"),
+    "exemption_retirement": ("пенсионер", "работающий пенсионер", "пенсионного возраста", "до пенсии", "осталось до пенсии"),
+
+    
 }
 
 def _detect_category_key(q: str) -> Optional[str]:
@@ -180,7 +182,7 @@ def _detect_category_key(q: str) -> Optional[str]:
 def classify_question(q: str) -> Dict[str, Any]:
     ql = (q or "").lower().replace("ё","е")
     cat = _detect_category_key(ql)
-    # приоритет: порог → льготы зарубеж → требования/категория → процедура → general
+    # приоритет: пенсионеры → порог → льготы зарубеж → категория → процедура → general
     if any(k in ql for k in INTENT_KEYWORDS["exemption_retirement"]):
         return {"intent": "exemption_retirement", "category": None, "confidence": 0.9}
     if any(k in ql for k in INTENT_KEYWORDS["threshold"]):
@@ -192,6 +194,7 @@ def classify_question(q: str) -> Dict[str, Any]:
     if any(k in ql for k in INTENT_KEYWORDS["procedure"]):
         return {"intent": "procedure", "category": None, "confidence": 0.75}
     return {"intent": "general", "category": None, "confidence": 0.5}
+
 
 POLICIES = {
     "threshold": {
@@ -224,13 +227,53 @@ POLICIES = {
         "max_citations": 3,
         "short_template": "{fallback_short}"
     },
+    "exemption_foreign": {
+    # Льгота по п.32: присвоение «модератора» без аттестации при наличии степени
+    "primary":   [("32","")],
+    # Можно дать процедурный п.10 вторично, но БЕЗ п.39
+    "secondary": [("10","")],
+    "max_citations": 2,
+    "short_template": (
+        "Если у вас есть учёная степень (канд./д-р наук/PhD) — присваивается «педагог-модератор» без аттестации (п.32); "
+        "если степени нет — проходите аттестацию по общим правилам."
+    )
+    },
     "exemption_retirement": {
-        "primary":   [("30","")],        # освобождение за ≤4 года до пенсии
-        "secondary": [("57","")],        # порядок аттестации для работающих пенсионеров
-        "max_citations": 3,
-        "short_template": "Зависит: если до пенсии ≤ 4 лет — освобождение (п.30); если уже пенсионер и работаете — аттестация по п.57."
-    }
-}
+        # Освобождение за ≤4 года до пенсии
+        "primary":   [("30","")],
+        # Порядок для работающих пенсионеров (обычно без ОЗП, комплексное обобщение)
+        "secondary": [("57","")],
+        "max_citations": 2,
+        "short_template": (
+            "Зависит: если до пенсии ≤ 4 лет — освобождение от процедуры (п.30); "
+            "если уже пенсионер и продолжаете работать — действует особый порядок (п.57)."
+    ),
+    # Если у тебя поддерживается long_template — будет аккуратный «Подробный вывод»
+    "long_template": (
+        "Если до достижения пенсионного возраста осталось ≤ 4 лет, вы освобождаетесь от прохождения процедуры аттестации; "
+        "имеющаяся категория сохраняется до наступления пенсии (п.30). "
+        "Если вы уже достигли пенсионного возраста и продолжаете работать, применяется порядок п.57 "
+        "(как правило, освобождение от ОЗП и проведение комплексного обобщения результатов деятельности)."
+    )
+
+    },
+def build_short_answer(policy: dict | None, ctx: dict, fallback_short: str) -> str:
+    """
+    Если у политики есть свой short_template — используем только его.
+    fallback_short применяем только при отсутствии политики или шаблона.
+    """
+    if not policy:
+        return fallback_short
+
+    tmpl = policy.get("short_template")
+    if tmpl:
+        # Безопасное форматирование, даже если каких-то ключей нет в ctx
+        try:
+            return tmpl.format(**(ctx or {}))
+        except Exception:
+            return tmpl  # используем как есть, чтобы не упасть
+
+    return fallback_short
 
 def _policy_primary_pairs(intent: str, category_key: Optional[str]) -> List[Tuple[str,str]]:
     pairs = []
@@ -327,7 +370,6 @@ def ensure_min_citations_policy(question: str,
     intent = intent_info.get("intent","general")
     category_key = intent_info.get("category")
     primary = _policy_primary_pairs(intent, category_key)
-    secondary = _policy_primary_pairs("secondary_override", None)  # заглушка, не используется
     # формируем must-have список: primary из политики + если есть — вторичные из политики
     want = list(primary)
     for pn, sp in POLICIES.get(intent, {}).get("secondary", []):
@@ -1511,6 +1553,19 @@ def filter_citations_by_question(
             if base_full:
                 c["quote"] = _crop_around(base_full, pref_terms, width=QUOTE_WIDTH_DEFAULT)
         return out
+        # retirement?
+    if any(k in ql for k in ("пенсион", "работающий пенсионер", "до пенсии")):
+        p30 = [c for c in clean if str(c.get("punkt_num","")).strip() == "30"]
+        p57 = [c for c in clean if str(c.get("punkt_num","")).strip() == "57"]
+        rest = [c for c in clean if c not in (p30 + p57)]
+        out = (p30 + p57 + rest)[:2]  # обычно 1–2 цитаты достаточно
+        for c in out:
+            key = (str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip())
+            base_full = by_key_full.get(key, "")
+            if base_full:
+                # короткий фрагмент вокруг ключевых слов
+                c["quote"] = _crop_around(base_full, ("пенсион", "освобожда", "обобщен", "озп"), width=QUOTE_WIDTH_DEFAULT)
+        return out
 
     # category?
     target = None
@@ -1744,28 +1799,32 @@ def render_detailed_html(question: str, data: Dict[str, Any], punkts: List[Dict[
 
     citations = validate_citations(data.get("citations", []), punkts)
     citations = filter_citations_by_question(question, citations, punkts)
+    # не шумим «связанными пунктами» для порога/льгот/пенсионеров
+    intent = classify_question(question).get("intent", "general")
+    HIDE_RELATED = {"threshold", "exemption_foreign", "exemption_retirement"}
+
 
     # Авто-related: если в наборе пунктов контекста присутствуют 39 или 63.*, а в citations их нет — добавим в related
     have_cit = {(str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip()) for c in citations}
     related = data.get("related", []) or []
-
-    def _exists(pn: str, sp: str = "") -> bool:
+    if intent not in HIDE_RELATED:
+        # Авто-related только если это уместно
+        have_cit = {(str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip()) for c in citations}
+        def _exists(pn: str, sp: str = "") -> bool:
+            for p in punkts:
+                if str(p.get("punkt_num","")).strip()==pn and (sp=="" or str(p.get("subpunkt_num","")).strip()==sp):
+                    return True
+            return False
+        def _push(pn: str, sp: str = "") -> None:
+            if (pn, sp) not in have_cit:
+                related.append({"punkt_num": pn, "subpunkt_num": sp})
+        if _exists("39"): _push("39","")
         for p in punkts:
-            if str(p.get("punkt_num","")).strip()==pn and (sp=="" or str(p.get("subpunkt_num","")).strip()==sp):
-                return True
-        return False
+            if str(p.get("punkt_num","")).strip()=="63":
+                _push("63", str(p.get("subpunkt_num","")).strip())
+                break
+    data["related"] = related
 
-    def _push(pn: str, sp: str = "") -> None:
-        if (pn, sp) not in have_cit:
-            related.append({"punkt_num": pn, "subpunkt_num": sp})
-
-    if _exists("39"): _push("39","")
-    for p in punkts:
-        if str(p.get("punkt_num","")).strip()=="63":
-            _push("63", str(p.get("subpunkt_num","")).strip())
-            break
-
-    data["related"] = related  # синхронизируем
 
     lines: List[str] = []
     lines.append(f"<b>Вопрос:</b> {html.escape(question)}")
@@ -1790,6 +1849,15 @@ def render_detailed_html(question: str, data: Dict[str, Any], punkts: List[Dict[
             head = f"п. {pn}{('.' + sp) if sp else ''}".strip()
             lines.append(f"• {head}")
     return "\n".join(lines).strip()
+# Интенты, где «Связанные пункты» лучше скрыть, чтобы не шуметь
+INTENTS_HIDE_RELATED = {"threshold", "exemption_foreign", "exemption_retirement"}
+
+def render_related(intent: str, related_items: list[str]) -> str:
+    if intent in INTENTS_HIDE_RELATED:
+        return ""
+    if not related_items:
+        return ""
+    return "Связанные пункты:\n" + "\n".join(f"• {x}" for x in related_items)
 
 def tg_set_webhook(full_url: str, secret: Optional[str]) -> None:
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook"
