@@ -166,7 +166,12 @@ CATEGORY_LABEL = {
 INTENT_KEYWORDS = {
     "threshold": ("порог", "порогов", "пороговы", "балл", "баллы", "сколько баллов", "озп", "оценка знаний", "тест", "тестирован", "процент", "80%", "минимальный процент", "минимальный балл", "сколько процентов", "сколько баллов", "надо набрать"),
     "procedure": ("как сдать", "как проходит", "этап", "этапы", "заявлен", "подать", "портфолио", "комисси", "обобщен"),
-    "exemption_foreign": ("магист", "за рубеж", "зарубеж", "за границ", "иностран", "болаш", "bolash", "nazarbayev"),
+    "exemption_foreign": (
+    "болаш", "bolash",
+    "nazarbayev", "nazarbayev university",
+    "перечень рекомендованных", "перечень организаций"
+),
+
     "exemption_retirement": ("пенсионер", "работающий пенсионер", "пенсионного возраста", "до пенсии", "осталось до пенсии"),
 
     
@@ -209,12 +214,7 @@ POLICIES = {
         "max_citations": 3,
         "short_template": "По общим правилам: требования для «педагога-{cat_human}» см. п. 5.{cat_sp}."
     },
-    "exemption_foreign": {
-        "primary": [("32","")],
-        "secondary": [("10","")],
-        "max_citations": 2,
-        "short_template": "Зависит: если магистратура из перечня — присваивают без аттестации (п.32); иначе — по общим правилам."
-    },
+
     "procedure": {
         "primary": [("10","")],
         "secondary": [("39","")],
@@ -435,20 +435,23 @@ def enforce_short_answer_policy(question: str,
     data["short_answer"] = sa[:200]
     return data
 
+
 def policy_get_must_have_pairs(intent_info: Dict[str,Any]) -> List[Tuple[str,str]]:
     intent = intent_info.get("intent","general")
     category_key = intent_info.get("category")
     pairs = _policy_primary_pairs(intent, category_key)
-    # добавим вторичные только для category_requirements (10, 39 полезны)
-    if intent == "category_requirements":
-        for pn, sp in POLICIES[intent]["secondary"]:
-            if sp == "<cat>":
-                if category_key:
-                    pn_c, sp_c = CAT_CANON.get(category_key, ("",""))
-                    if pn_c: pairs.append((pn_c, sp_c))
-            else:
-                pairs.append((pn, sp))
+
+    # добавляем secondary для ЛЮБОЙ политики
+    for pn, sp in POLICIES.get(intent, {}).get("secondary", []):
+        if sp == "<cat>":
+            if category_key:
+                pn_c, sp_c = CAT_CANON.get(category_key, ("",""))
+                if pn_c:
+                    pairs.append((pn_c, sp_c))
+        else:
+            pairs.append((pn, sp))
     return pairs
+
 
 
 
@@ -1802,7 +1805,6 @@ def render_detailed_html(question: str, data: Dict[str, Any], punkts: List[Dict[
     citations = filter_citations_by_question(question, citations, punkts)
     # не шумим «связанными пунктами» для порога/льгот/пенсионеров
     intent = classify_question(question).get("intent", "general")
-    HIDE_RELATED = {"threshold", "exemption_foreign", "exemption_retirement"}
 
 
     # Авто-related: если в наборе пунктов контекста присутствуют 39 или 63.*, а в citations их нет — добавим в related
