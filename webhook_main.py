@@ -1810,7 +1810,7 @@ def render_detailed_html(question: str, data: Dict[str, Any], punkts: List[Dict[
     # Авто-related: если в наборе пунктов контекста присутствуют 39 или 63.*, а в citations их нет — добавим в related
     have_cit = {(str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip()) for c in citations}
     related = data.get("related", []) or []
-    if intent not in HIDE_RELATED:
+    if intent not in INTENTS_HIDE_RELATED:
         # Авто-related только если это уместно
         have_cit = {(str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip()) for c in citations}
         def _exists(pn: str, sp: str = "") -> bool:
