@@ -114,12 +114,14 @@ EMBEDDINGS_PATH = os.environ.get("EMBEDDINGS_PATH", "embeddings.npy")
 PUNKTS_PATH = os.environ.get("PUNKTS_PATH", "pravila_detailed_tagged_autofix.json")
 
 # ВНИМАНИЕ: embeddings.npy сейчас на 1536-мерной модели ada-002 — оставляем такую же модель до пересчёта
-EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "text-embedding-ada-002")
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-large")
+
 CHAT_MODEL = os.environ.get("CHAT_MODEL", "gpt-4o-mini")
 
 
 MULTI_QUERY = os.environ.get("MULTI_QUERY", "0") == "1"
 HYDE = os.environ.get("HYDE", "0") == "1"  # ⬅️ добавить эту строку
+LLM_RERANK = os.environ.get("LLM_RERANK", "1") == "1"
 
 
 SHEET_ID = os.environ.get("SHEET_ID", "").strip() or None
@@ -129,10 +131,11 @@ GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip() 
 W_EMB = 1.0
 W_BM25 = 1.0
 W_MAP = 1.0
-W_REGEX = 0.15
+W_REGEX = 0.25
+
 
 # категории (усиливаем вклад)
-W_CAT = 2.6
+W_CAT = 2.2
 CAT_KEYS = ("исследовател", "модератор", "эксперт", "мастер")
 
 # канонические подпункты для категорий (п.5.x)
@@ -176,7 +179,11 @@ INTENT_KEYWORDS = {
     "fee": ("платить", "оплат", "стоимост", "платно", "бесплатн", "сбор", "госпошлин", "оплата"),
     "periodicity": ("как часто", "периодич", "каждые пять лет", "раз в пять лет", "1 раз в 5 лет", "один раз в три года", "1 раз в 3 года", "частота"),
     "commission": ("кто входит", "кто входить", "состав комис", "члены комис", "комиссия по аттестации", "кто в комисси"),
-    "publications": ("публикац", "журнал", "стать", "doi", "scopus", "web of science", "wos", "рекомендован", "индексир"),
+    # должно быть:
+    "publications": (    "публикац", "журнал", "стат", "scopus", "web of science", "wos", "doi", "индексир", "рекомендован"
+    ),
+
+
     "procedure": ("как сдать", "как проходит", "этап", "этапы", "заявлен", "подать", "портфолио", "комисси", "обобщен"),
     "exemption_foreign": (
         "болаш", "болаша", "болашақ", "bolash",
@@ -534,7 +541,7 @@ def kw_category_boost(question: str, doc_text: str) -> float:
 
 
 
-W_KW = 0.9  # вес сигнала по ключевым словам для тематических исключений/зарубеж
+W_KW = 1.1  # вес сигнала по ключевым словам для тематических исключений/зарубеж
 KW_EXCEPTION_TERMS = (
     "без прохождения процедуры аттестации",
     "присваивается без",
@@ -636,13 +643,26 @@ def load_punkts(path: str) -> List[Dict[str, Any]]:
 
 PUNKTS: List[Dict[str, Any]] = load_punkts(PUNKTS_PATH)
 
+
 # embeddings.npy — memmap для экономии памяти/быстрой загрузки
 PUNKT_EMBS: np.ndarray = np.load(EMBEDDINGS_PATH, mmap_mode="r")
 assert PUNKT_EMBS.ndim == 2, "embeddings.npy must be 2D"
 assert PUNKT_EMBS.shape[0] == len(PUNKTS), "rows(embeddings) != len(PUNKTS)"
-if EMBEDDING_MODEL == "text-embedding-ada-002":
-    assert PUNKT_EMBS.shape[1] == 1536, "For ada-002 expected 1536 dims"
-logger.info("Loaded %d punkts; embeddings: %s", len(PUNKTS), PUNKT_EMBS.shape)
+
+EMB_DIM = int(PUNKT_EMBS.shape[1])
+if EMB_DIM not in (1536, 3072):
+    raise AssertionError(f"Unexpected embedding dimension: {EMB_DIM} (expected 1536 or 3072)")
+
+# Автосогласование модели с файлом эмбеддингов
+if EMB_DIM == 1536 and EMBEDDING_MODEL != "text-embedding-ada-002":
+    logger.warning("Detected 1536-dim embeddings.npy → переключаю EMBEDDING_MODEL на text-embedding-ada-002")
+    EMBEDDING_MODEL = "text-embedding-ada-002"
+elif EMB_DIM == 3072 and EMBEDDING_MODEL != "text-embedding-3-large":
+    logger.warning("Detected 3072-dim embeddings.npy → переключаю EMBEDDING_MODEL на text-embedding-3-large")
+    EMBEDDING_MODEL = "text-embedding-3-large"
+
+logger.info("Loaded %d punkts; embeddings: %s; model=%s", len(PUNKTS), PUNKT_EMBS.shape, EMBEDDING_MODEL)
+
 
 def tokenize(text: str) -> List[str]:
     return re.findall(r"[а-яёa-z0-9]+", (text or "").lower())
@@ -882,6 +902,13 @@ def rag_search(q: str, top_k_stage1: int = 120, final_k: int = 45,
     variants = multi_query_rewrites(q)
     dense_agg: Dict[int, float] = {}
     sparse_agg: Dict[int, float] = {}
+    # дополнительное сужение выдачи по интенту
+    try:
+        info_int = classify_question(q)
+        if info_int and info_int.get("intent") in {"commission", "fee", "publications"}:
+            final_k = min(final_k, 20)
+    except Exception:
+        pass
 
     # Dense pass 1
     for v in variants:
@@ -1003,29 +1030,113 @@ GEN_PROMPT_TEMPLATE = """\
 5a) Если вопрос про конкретную категорию — в "reasoned_answer" сделай КОРОТКИЙ маркированный список (2–6 пунктов)
      ключевых компетенций ИСКЛЮЧИТЕЛЬНО из процитированного п.5.x (без домыслов), затем один абзац с процедурой (если процитированы соответствующие пункты).
 6) JSON — без лишних полей, без комментариев, кавычки только двойные.
+7) Если в переданном контексте НЕТ нормы, отвечающей прямо на вопрос, явно напиши, что прямого ответа нет; не додумывай детали.
 """
 
-
-
-
-
-
 def build_context_snippets(punkts: List[Dict[str, Any]], max_chars: int = 12000) -> str:
-    
-    """Собираем контекст: «п. X[.Y]: текст…»; ограничиваем размер для токенов."""
+    def _window(txt: str, width_chars: int = 700) -> str:
+        t = _collapse_repeats(txt or "").replace("\u00A0", " ")
+        return t[:width_chars] + ("…" if len(t) > width_chars else "")
     parts: List[str] = []
     total = 0
     for p in punkts:
         pn = str(p.get("punkt_num") or "").strip()
         sp = str(p.get("subpunkt_num") or "").strip()
         head = f"п. {pn}{('.' + sp) if sp else ''}".strip()
-        txt = (p.get("text") or "").strip()
-        one = f"{head}: {txt}"
+        one = f"{head}: {_window(p.get('text',''))}"
         if total + len(one) + 2 > max_chars:
             break
-        parts.append(one)
-        total += len(one) + 2
+        parts.append(one); total += len(one) + 2
     return "\n\n".join(parts)
+def llm_rerank(question: str, punkts: List[Dict[str, Any]], top_n: int = 12) -> List[Dict[str, Any]]:
+    if not LLM_RERANK or not punkts:
+        return punkts[:top_n]
+    # Краткие превью кандидатов
+    items = []
+    for p in punkts[:40]:
+        pn = str(p.get("punkt_num","")).strip()
+        sp = str(p.get("subpunkt_num","")).strip()
+        pv = _collapse_repeats(p.get("text","")).split(". ")
+        preview = ". ".join(pv[:2])[:300]
+        items.append(f"{pn}.{sp or '–'}: {preview}")
+
+    prompt = (
+        "Вопрос: " + question + "\n\n"
+        "Ниже список кандидатов «п.номер: фрагмент». Верни СТРОГИЙ JSON с массивом items, "
+        "где каждый элемент: {\"punkt_num\":\"N\",\"subpunkt_num\":\"M или ''\"}. "
+        f"Выбери не более {top_n} наиболее релевантных по вопросу, по убыванию важности.\n\n"
+        + "\n".join(items)
+    )
+    try:
+        resp = call_with_retries(
+            client.chat.completions.create,
+            model=CHAT_MODEL,
+            messages=[
+                {"role":"system","content":"Ты выбираешь самые релевантные нормы Правил к вопросу. Без домыслов."},
+                {"role":"user","content": prompt},
+            ],
+            temperature=0,
+            response_format={"type":"json_object"},
+        )
+        raw = json.loads(resp.choices[0].message.content or "{}")
+        picked = raw.get("items") or []
+        want = { (str(x.get("punkt_num","")).strip(), str(x.get("subpunkt_num","")).strip()) for x in picked if isinstance(x, dict) }
+        if not want:
+            return punkts[:top_n]
+        out: List[Dict[str, Any]] = []
+        for p in punkts:
+            key = (str(p.get("punkt_num","")).strip(), str(p.get("subpunkt_num","")).strip())
+            if key in want and p not in out:
+                out.append(p)
+            if len(out) >= top_n:
+                break
+        return out or punkts[:top_n]
+    except Exception:
+        return punkts[:top_n]
+def narrow_punkts_by_intent(question: str, punkts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    info = classify_question(question)
+    intent = info.get("intent", "general")
+    cat = info.get("category")
+
+    def _pn(p): return str(p.get("punkt_num","")).strip()
+    def _sp(p): return str(p.get("subpunkt_num","")).strip()
+
+    if intent == "commission":
+        keep = [p for p in punkts if _pn(p) == "63"]
+        keep10 = [p for p in punkts if _pn(p) == "10"][:1]
+        return (keep + keep10)[:12] or punkts[:12]
+
+    if intent == "fee":
+        keep41 = [p for p in punkts if _pn(p) == "41"]
+        keep10 = [p for p in punkts if _pn(p) == "10"][:1]
+        return (keep41 + keep10 + [p for p in punkts if p not in keep41][:6])[:12] or punkts[:12]
+
+    if intent == "publications":
+        cat_pair = CAT_CANON.get(cat or "", ("",""))
+        head = []
+        if cat_pair[0]:
+            head = [p for p in punkts if _pn(p)=="5" and _sp(p)==cat_pair[1]]
+        five = [p for p in punkts if _pn(p)=="5" and p not in head][:6]
+        ten  = [p for p in punkts if _pn(p)=="10"][:1]
+        return (head + five + ten)[:12] or punkts[:12]
+
+    if intent == "periodicity":
+        keys = ("не реже одного раза", "раз в пять лет", "каждые пять лет", "периодич")
+        good = []
+        for p in punkts:
+            tl = (p.get("text") or "").lower().replace("ё","е")
+            if any(k in tl for k in keys):
+                good.append(p)
+        keep10 = [p for p in punkts if _pn(p)=="10"][:1]
+        return (good + keep10)[:12] or punkts[:12]
+
+    if intent == "threshold":
+        p39 = [p for p in punkts if _pn(p)=="39"]
+        p10 = [p for p in punkts if _pn(p)=="10"][:1]
+        return (p39 + p10 + [p for p in punkts if p not in p39][:6])[:12] or punkts[:12]
+
+    return punkts[:12]
+
 
 def ask_llm(question: str, punkts: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
@@ -1142,8 +1253,24 @@ def ask_llm(question: str, punkts: List[Dict[str, Any]]) -> Dict[str, Any]:
         return out
 
     # ───── первичный запрос ─────
+    # ───── первичный запрос ─────
     context_text = build_context_snippets(punkts)
-    user_prompt = _build_user_prompt(GEN_PROMPT_TEMPLATE, question, context_text)
+
+    # добавим гард: если must-have нормы из политики отсутствуют в контексте — требуем от LLM честно сказать, что прямого ответа нет
+    intent_info = classify_question(question)
+    must_pairs = policy_get_must_have_pairs(intent_info)
+    have_keys = {(str(p.get("punkt_num","")).strip(), str(p.get("subpunkt_num","")).strip()) for p in punkts}
+    missed = [pair for pair in must_pairs if pair not in have_keys]
+    extra_guard = ""
+    if must_pairs and missed:
+        extra_guard = (
+            "\nВАЖНО: В переданном контексте нет ключевой нормы по сути вопроса. "
+            "Ты обязан вернуть короткий вывод вида "
+            "\"По переданному фрагменту прямого ответа нет; действует общий порядок\" "
+            "и не додумывать детали."
+        )
+
+    user_prompt = _build_user_prompt(GEN_PROMPT_TEMPLATE + extra_guard, question, context_text)
 
     resp = call_with_retries(
         client.chat.completions.create,
@@ -1594,6 +1721,16 @@ def filter_citations_by_question(
             else:
                 c["quote"] = _collapse_repeats(_crop_around(base_full, tuple(), width=QUOTE_WIDTH_DEFAULT))
         return out[:3]
+        # publications?
+    if intent == "publications":
+        out = clean[:2]
+        keys_pub = ("публикац","журнал","стат","scopus","web of science","wos","doi","индексир","рекомендован")
+        for c in out:
+            key = (str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip())
+            base_full = by_key_full.get(key, "")
+            if base_full:
+                c["quote"] = _collapse_repeats(_crop_around(base_full, keys_pub, width=QUOTE_WIDTH_DEFAULT if key[0]!="5" else QUOTE_WIDTH_LONG))
+        return out
 
     # fee — просто до 2 релевантных, не выкидывая 41
     if intent == "fee":
@@ -2029,10 +2166,16 @@ async def handle_webhook(request: web.Request) -> web.Response:
             policy_pairs = policy_get_must_have_pairs(intent_info)
             logger.info("policy_pairs=%s", policy_pairs)
             punkts = await run_blocking(rag_search, text, must_have_pairs=policy_pairs)
+
+            # NEW: LLM-rerank + сужение по интенту
+            punkts = llm_rerank(text, punkts, top_n=18)
+            punkts = narrow_punkts_by_intent(text, punkts)
+
             logger.info("top_punkts=%s", [(p.get('punkt_num'), p.get('subpunkt_num')) for p in punkts[:10]])
 
             # 2) LLM
             data_struct = await run_blocking(ask_llm, text, punkts)
+
 
             # 3) Политика: минимум цитат и краткий ответ
             data_struct = ensure_min_citations_policy(text, data_struct, punkts, intent_info)
