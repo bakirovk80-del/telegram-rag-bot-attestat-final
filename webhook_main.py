@@ -343,54 +343,6 @@ def _human_cat(category_key: Optional[str]) -> Tuple[str, str]:
     return (human, sp)
 
 # ─────────── Slot-extractors (универсальные извлекатели фактов) ───────────
-def extract_threshold_percent_from_p39_for_category(punkts: List[Dict[str,Any]], category_key: Optional[str]) -> Optional[str]:
-    if not category_key:
-        return None
-
-    want = {
-        "модератор":    ("модератор", "moderator", "moderat"),
-        "эксперт":      ("эксперт", "expert", "ekspert"),
-        "исследовател": ("исследовател", "исследователь", "issled"),
-        "мастер":       ("мастер", "master"),
-    }
-    target_syns = want.get(category_key, ())
-    if not target_syns:
-        return None
-
-    text39 = None
-    for p in punkts:
-        if str(p.get("punkt_num","")).strip() == "39":
-            text39 = (p.get("text") or ""); break
-    if not text39:
-        return None
-
-    tl = text39.lower().replace("ё","е")
-    pat_map = {
-        "модератор":    r"(педагог[\-\s]*модератор[^0-9%]{0,80}?(\d{1,3})\s*%)",
-        "эксперт":      r"(педагог[\-\s]*эксперт[^0-9%]{0,80}?(\d{1,3})\s*%)",
-        "исследовател": r"(педагог[\-\s]*исслед[^0-9%]{0,80}?(\d{1,3})\s*%)",
-        "мастер":       r"(педагог[\-\s]*мастер[^0-9%]{0,80}?(\d{1,3})\s*%)",
-    }
-    m = re.search(pat_map.get(category_key, ""), tl, flags=re.I)
-    if m:
-        try:
-            return f"{int(m.group(2))}%"
-        except Exception:
-            pass
-
-    positions = [tl.find(s) for s in target_syns if tl.find(s) != -1]
-    if not positions:
-        return None
-    pos = min(positions)
-    start = max(0, pos - 250); end = min(len(tl), pos + 250)
-    window = tl[start:end]
-    nums = [int(x) for x in re.findall(r"(\d{1,3})\s*%", window)]
-    if nums:
-        for pval in (60, 70, 80, 90):
-            if pval in nums:
-                return f"{pval}%"
-        return f"{max(nums)}%"
-    return None
 
 def build_procedure_tail_if_p10(punkts: List[Dict[str,Any]]) -> str:
     for p in punkts:
@@ -998,11 +950,7 @@ def rag_search(q: str, top_k_stage1: int = 120, final_k: int = 45,
             must_have.extend(add)
 
     
-    foreign_generic = any(k in ql for k in ("магист", "зарубеж", "за границ", "иностран"))
-    bolashak_explicit = any(k in ql for k in ("болаш", "nazarbayev", "перечень рекомендованных"))
-    if bolashak_explicit:
-        p32 = [i for i, p in enumerate(PUNKTS) if str(p.get("punkt_num","")).strip()=="32"]
-        must_have = p32 + must_have
+
 
   # ── ДОБАВИТЬ: внешние must-have по политике ──
     if must_have_pairs:
@@ -1393,79 +1341,6 @@ def enforce_short_answer(question: str, data: dict, ctx_text: str) -> dict:
     return data
 
 
-def ensure_min_citations_policy(question: str,
-                                data: Dict[str,Any],
-                                punkts: List[Dict[str,Any]],
-                                intent_info: Dict[str,Any]) -> Dict[str,Any]:
-    ql = (question or "").lower().replace("ё", "е")
-    intent = intent_info.get("intent","general")
-    cits = [dict(c) for c in (data.get("citations") or [])]
-
-    def _exists_in_context(pn: str, sp: str = "") -> Optional[Dict[str, str]]:
-        for p in punkts:
-            if str(p.get("punkt_num","")).strip() == pn and (not sp or str(p.get("subpunkt_num","")).strip() == sp):
-                return {"punkt_num": pn, "subpunkt_num": sp, "quote": ""}
-        return None
-
-    # выкинем 3/41 для всех, КРОМЕ fee (где п.41 критичен)
-    skip = {"3"} if intent == "fee" else {"3","41"}
-    cits = [c for c in cits if str(c.get("punkt_num","")).strip() not in skip]
-
-    if len(cits) >= 2:
-        data["citations"] = cits[:3]
-        return data
-
-    target = None
-    for key, syns in CATEGORY_SYNONYMS.items():
-        if any(s in ql for s in syns):
-            target = key; break
-
-    need: List[Dict[str, str]] = []
-
-    if target:
-        pn, sp = CAT_CANON.get(target, ("",""))
-        if pn:
-            hit = _exists_in_context(pn, sp) or _exists_in_context(pn, "")
-            if hit: need.append(hit)
-        for pn in ("10","39"):
-            hit = _exists_in_context(pn, "")
-            if hit: need.append(hit)
-    elif intent == "exemption_foreign":
-        hit32 = _exists_in_context("32","")
-        if hit32: need.append(hit32)
-        hit10 = _exists_in_context("10","")
-        if hit10: need.append(hit10)
-    elif intent == "fee":
-        hit41 = _exists_in_context("41","")
-        if hit41: need.append(hit41)
-
-    if not need:
-        seen = set()
-        for p in punkts:
-            pn = str(p.get("punkt_num","")).strip()
-            sp = str(p.get("subpunkt_num","")).strip()
-            if pn in skip: 
-                continue
-            key = (pn, sp)
-            if key in seen:
-                continue
-            need.append({"punkt_num": pn, "subpunkt_num": sp, "quote": ""})
-            seen.add(key)
-            if len(need) >= 2:
-                break
-
-    out: List[Dict[str, str]] = []
-    seen_keys = set()
-    for c in need + cits:
-        pn = str(c.get("punkt_num","")).strip()
-        sp = str(c.get("subpunkt_num","")).strip()
-        key = (pn, sp)
-        if pn and key not in seen_keys:
-            out.append({"punkt_num": pn, "subpunkt_num": sp, "quote": c.get("quote","")})
-            seen_keys.add(key)
-
-    data["citations"] = out[:3]
-    return data
 # ───────────────────── Пост-процесс и рендер ────────────────────
 
 def _collapse_repeats(text: str) -> str:
@@ -1692,7 +1567,7 @@ def filter_citations_by_question(
         for c in out:
             key = (str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip())
             base_full = by_key_full.get(key, "")
-            if not base_full: 
+            if not base_full:
                 continue
             pn = key[0]
             if pn == "5":
@@ -1737,7 +1612,10 @@ def filter_citations_by_question(
         base_full = by_key_full.get(key, "")
         if base_full:
             c["quote"] = _collapse_repeats(_crop_around(base_full, tuple(), width=QUOTE_WIDTH_DEFAULT))
-    return outdef enforce_reasoned_answer(question: str, data: Dict[str, Any], punkts: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return out
+
+
+def enforce_reasoned_answer(question: str, data: Dict[str, Any], punkts: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Для вопросов про категорию:
     — короткий маркированный список (2–6 пунктов) компетенций из канонического п.5.x;
@@ -1798,33 +1676,53 @@ def filter_citations_by_question(
     else:
         data["reasoned_answer"] = current + "\n\n" + "\n".join(lines)
     return data
-# ── Вставить рядом с enforce_short_answer_policy/enforce_reasoned_answer ──
+# 1) Общий экстрактор процента порога из п.39 (fallback для любых категорий)
+def extract_threshold_percent_from_p39(punkts: List[Dict[str, Any]]) -> Optional[str]:
+    """
+    Ищем в тексте п.39 ближайший вид 'NN %' и возвращаем:
+      - приоритетно 80%, если встречается;
+      - иначе максимум из найденных процентов;
+      - иначе None.
+    """
+    text39 = None
+    for p in punkts:
+        if str(p.get("punkt_num", "")).strip() == "39":
+            text39 = (p.get("text") or "")
+            break
+    if not text39:
+        return None
+
+    tl = text39.lower().replace("ё", "е")
+    nums = [int(x) for x in re.findall(r"(\d{1,3})\s*%", tl)]
+    if not nums:
+        return None
+    if 80 in nums:
+        return "80%"
+    return f"{max(nums)}%"
+# 2) Политкорректное выравнивание "reasoned_answer" по политикам (льготы/пенсионеры + long_template)
 def enforce_policy_reasoned_answer(question: str,
-                                   data: Dict[str,Any],
-                                   intent_info: Dict[str,Any]) -> Dict[str,Any]:
+                                   data: Dict[str, Any],
+                                   intent_info: Dict[str, Any]) -> Dict[str, Any]:
     import re
-    intent = intent_info.get("intent","general")
+    intent = intent_info.get("intent", "general")
     policy = POLICIES.get(intent, {})
     long_t = policy.get("long_template")
     ra = (data.get("reasoned_answer") or "").strip()
 
-    # для льгот/пенсионеров убираем жесткие формулировки «обязан/обязательно»
+    # смягчаем формулировки для льготных кейсов
     if intent in {"exemption_foreign", "exemption_retirement"}:
         ra = re.sub(r"\b(обязан|обязательно|должен|необходимо)\b",
-            "применяется порядок, предусмотренный Правилами",
-            ra, flags=re.I)
+                    "применяется порядок, предусмотренный Правилами",
+                    ra, flags=re.I)
 
-
-    # если есть длинный шаблон — ставим его первым и считаем «истиной по умолчанию»
+    # если у политики есть длинный шаблон — ставим его как основу
     if long_t:
-        if len(ra) < 40:
-            data["reasoned_answer"] = long_t
-        else:
-            data["reasoned_answer"] = long_t + ("\n\n" + ra if ra else "")
+        data["reasoned_answer"] = long_t + (("\n\n" + ra) if ra else "")
     else:
         data["reasoned_answer"] = ra
 
     return data
+
 # ── Вставить сразу после enforce_policy_reasoned_answer ──
 def sanitize_numeric_claims(data: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -2118,51 +2016,51 @@ async def handle_webhook(request: web.Request) -> web.Response:
         await run_blocking(tg_send_message, chat_id, "Пожалуйста, пришлите текстовый вопрос.")
         return web.Response(text="ok")
 
-    # Пер-чатовая блокировка
+    # Пер-чатовая блокировка: обрабатываем апдейты последовательно
     lock = LOCKS.setdefault(int(chat_id), asyncio.Lock())
-    if lock.locked():
-        await run_blocking(tg_send_message, chat_id, "Уже обрабатываю ваш предыдущий вопрос, одну секунду 🙌")
-        return web.Response(text="ok")
-        # Пер-чатовая блокировка
-    lock = LOCKS.setdefault(int(chat_id), asyncio.Lock())
-   
 
     async with lock:
-    try:
-        # 0) Интент
-        intent_info = classify_question(text)
-        logger.info("intent=%s cat=%s", intent_info.get("intent"), intent_info.get("category"))
+        try:
+            # 0) Интент
+            intent_info = classify_question(text)
+            logger.info("intent=%s cat=%s", intent_info.get("intent"), intent_info.get("category"))
 
-        # 1) must-have по политике
-        policy_pairs = policy_get_must_have_pairs(intent_info)
-        logger.info("policy_pairs=%s", policy_pairs)
-        punkts = await run_blocking(rag_search, text, must_have_pairs=policy_pairs)
-        logger.info("top_punkts=%s", [(p.get('punkt_num'), p.get('subpunkt_num')) for p in punkts[:10]])
+            # 1) must-have по политике
+            policy_pairs = policy_get_must_have_pairs(intent_info)
+            logger.info("policy_pairs=%s", policy_pairs)
+            punkts = await run_blocking(rag_search, text, must_have_pairs=policy_pairs)
+            logger.info("top_punkts=%s", [(p.get('punkt_num'), p.get('subpunkt_num')) for p in punkts[:10]])
 
-        # 2) LLM
-        data_struct = await run_blocking(ask_llm, text, punkts)
+            # 2) LLM
+            data_struct = await run_blocking(ask_llm, text, punkts)
 
-        # 3) Политика: минимум цитат и краткий ответ
-        data_struct = ensure_min_citations_policy(text, data_struct, punkts, intent_info)
-        data_struct = enforce_short_answer_policy(text, data_struct, punkts, intent_info)
+            # 3) Политика: минимум цитат и краткий ответ
+            data_struct = ensure_min_citations_policy(text, data_struct, punkts, intent_info)
+            data_struct = enforce_short_answer_policy(text, data_struct, punkts, intent_info)
 
-        # 4) Буллеты — только для категории
-        if intent_info.get("intent") == "category_requirements":
-            data_struct = enforce_reasoned_answer(text, data_struct, punkts)
+            # 4) Буллеты — только для категории
+            if intent_info.get("intent") == "category_requirements":
+                data_struct = enforce_reasoned_answer(text, data_struct, punkts)
 
-        # 4a) Политическое выравнивание
-        data_struct = enforce_policy_reasoned_answer(text, data_struct, intent_info)
+            # 4a) Политическое выравнивание
+            data_struct = enforce_policy_reasoned_answer(text, data_struct, intent_info)
 
-        # 4b) Санитайз чисел
-        data_struct = sanitize_numeric_claims(data_struct)
+            # 4b) Санитайз чисел (блок #6)
+            data_struct = sanitize_numeric_claims(data_struct)
 
-        # 5) HTML и отправка
-        short_html = render_short_html(text, data_struct)
-        detailed_html = render_detailed_html(text, data_struct, punkts)
-        ...
-    except Exception:
-        logger.exception("Processing failed")
-        await run_blocking(tg_send_message, chat_id, "Произошла ошибка при обработке запроса. Попробуйте позже.")
+            # 5) HTML и отправка
+            short_html = render_short_html(text, data_struct)
+            detailed_html = render_detailed_html(text, data_struct, punkts)
+
+            msg_id = await run_blocking(tg_send_message, chat_id, short_html, reply_markup=kb_show_detailed())
+            if msg_id:
+                LAST_RESPONSES[(int(chat_id), int(msg_id))] = {
+                    "short_html": short_html,
+                    "detailed_html": detailed_html,
+                }
+        except Exception:
+            logger.exception("Processing failed")
+            await run_blocking(tg_send_message, chat_id, "Произошла ошибка при обработке запроса. Попробуйте позже.")
 
     return web.Response(text="ok")
 # ─────────────────────────── main() ─────────────────────────────
