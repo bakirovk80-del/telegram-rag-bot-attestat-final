@@ -163,7 +163,7 @@ CATEGORY_LABEL = {
 
 # ─────────────────────── Intent + Policy (универсальный слой) ───────────────────────
 
-# ─────────────────────── Intent + Policy (универсальный слой) ───────────────────────
+
 
 INTENT_KEYWORDS = {
     "threshold": (
@@ -173,13 +173,17 @@ INTENT_KEYWORDS = {
         "процент", "80%", "минимальный процент", "минимальный балл",
         "сколько процентов", "сколько баллов", "надо набрать"
     ),
+    "fee": ("платить", "оплат", "стоимост", "платно", "бесплатн", "сбор", "госпошлин", "оплата"),
+    "periodicity": ("как часто", "периодич", "каждые пять лет", "раз в пять лет", "1 раз в 5 лет", "один раз в три года", "1 раз в 3 года", "частота"),
+    "commission": ("кто входит", "кто входить", "состав комис", "члены комис", "комиссия по аттестации", "кто в комисси"),
+    "publications": ("публикац", "журнал", "стать", "doi", "scopus", "web of science", "wos", "рекомендован", "индексир"),
     "procedure": ("как сдать", "как проходит", "этап", "этапы", "заявлен", "подать", "портфолио", "комисси", "обобщен"),
-    # расширили foreign, чтобы ловить «Болашак/NU/PhD/докторантура»
     "exemption_foreign": (
-        "болаш", "bolash",
+        "болаш", "болаша", "болашақ", "bolash",
         "nazarbayev", "nazarbayev university",
         "перечень рекомендованных", "перечень организаций",
-        "зарубеж", "за границ", "иностран",
+        "зарубеж", "за границ", "за пределами республики казахстан",
+        "иностран",
         "магистратур", "докторантур", "phd",
         "кандидат наук", "доктор наук", "ученая степень", "учёная степень"
     ),
@@ -197,15 +201,25 @@ def classify_question(q: str) -> Dict[str, Any]:
     ql = (q or "").lower().replace("ё","е")
     cat = _detect_category_key(ql)
 
-    # Приоритет: пенсионеры → зарубеж/льгота → ПОРОГ → категория → процедура → general
+    # Приоритет: пенсионеры → зарубеж/льготы → оплата → периодичность → комиссия → публикации → порог → категория → процедура → general
     if any(k in ql for k in INTENT_KEYWORDS["exemption_retirement"]):
         return {"intent": "exemption_retirement", "category": None, "confidence": 0.9}
 
     if any(k in ql for k in INTENT_KEYWORDS["exemption_foreign"]):
         return {"intent": "exemption_foreign", "category": None, "confidence": 0.9}
 
-    # ВАЖНО: пороговые вопросы ловим раньше категории,
-    # но саму категорию (если упомянута) передаем как context для шаблона threshold
+    if any(k in ql for k in INTENT_KEYWORDS["fee"]):
+        return {"intent": "fee", "category": None, "confidence": 0.9}
+
+    if any(k in ql for k in INTENT_KEYWORDS["periodicity"]):
+        return {"intent": "periodicity", "category": None, "confidence": 0.85}
+
+    if any(k in ql for k in INTENT_KEYWORDS["commission"]):
+        return {"intent": "commission", "category": None, "confidence": 0.85}
+
+    if any(k in ql for k in INTENT_KEYWORDS["publications"]):
+        return {"intent": "publications", "category": None, "confidence": 0.8}
+
     if any(k in ql for k in INTENT_KEYWORDS["threshold"]):
         return {"intent": "threshold", "category": cat, "confidence": 0.9}
 
@@ -220,8 +234,8 @@ def classify_question(q: str) -> Dict[str, Any]:
 
 POLICIES = {
     "threshold": {
-        "primary": [("39","")],                # всегда цитируем п.39
-        "secondary": [("10","")],              # процедура вторым номером
+        "primary": [("39","")],
+        "secondary": [("10","")],
         "max_citations": 3,
         "short_template": "По общим правилам: порог ОЗП — {threshold_percent} (п. 39).{procedure_tail}"
     },
@@ -231,48 +245,65 @@ POLICIES = {
         "max_citations": 3,
         "short_template": "По общим правилам: требования для «педагога-{cat_human}» см. п. 5.{cat_sp}."
     },
-
     "procedure": {
         "primary": [("10","")],
-        "secondary": [("39","")],
+        "secondary": [],
         "max_citations": 3,
         "short_template": "По общим правилам: этапы — заявление → портфолио → ОЗП → обобщение → решение комиссии (п.10)."
     },
-    "general": {
-        "primary": [],
-        "secondary": [("10","")],  # либо вообще []
-        "max_citations": 3,
-        "short_template": "{fallback_short}"
+    "fee": {
+        "primary": [("41","")],           # если есть в базе — попадёт в контекст
+        "secondary": [],
+        "max_citations": 2,
+        "short_template": "По общим правилам: вопросы оплаты установлены Правилами; см. цитаты ниже."
+    },
+    "periodicity": {
+        "primary": [],                    # подберём по ключевым словам
+        "secondary": [],
+        "max_citations": 2,
+        "short_template": "По общим правилам: периодичность прохождения установлена Правилами; см. цитаты ниже."
+    },
+    "commission": {
+        "primary": [("63","")],           # если такой пункт есть — подтянем состав комиссии
+        "secondary": [],
+        "max_citations": 2,
+        "short_template": "Состав аттестационной комиссии определяется Правилами; см. цитаты ниже."
+    },
+    "publications": {
+        "primary": [],                    # вытягиваем критерии портфолио по ключам
+        "secondary": [("10","")],
+        "max_citations": 2,
+        "short_template": "Публикации учитываются в портфолио по Правилам; см. конкретные критерии в цитатах."
     },
     "exemption_foreign": {
-    # Льгота по п.32: присвоение «модератора» без аттестации при наличии степени
-    "primary":   [("32","")],
-    # Можно дать процедурный п.10 вторично, но БЕЗ п.39
-    "secondary": [("10","")],
-    "max_citations": 2,
-    "short_template": (
-        "Если у вас есть учёная степень (канд./д-р наук/PhD) — присваивается «педагог-модератор» без аттестации (п.32); "
-        "если степени нет — проходите аттестацию по общим правилам."
-    )
+        "primary":   [("32","")],
+        "secondary": [("10","")],
+        "max_citations": 2,
+        "short_template": (
+            "Если у вас есть учёная степень (канд./д-р наук/PhD) — присваивается «педагог-модератор» без аттестации (п.32); "
+            "если степени нет — проходите аттестацию по общим правилам."
+        )
     },
     "exemption_retirement": {
-        # Освобождение за ≤4 года до пенсии
         "primary":   [("30","")],
-        # Порядок для работающих пенсионеров (обычно без ОЗП, комплексное обобщение)
         "secondary": [("57","")],
         "max_citations": 2,
         "short_template": (
             "Зависит: если до пенсии ≤ 4 лет — освобождение от процедуры (п.30); "
             "если уже пенсионер и продолжаете работать — действует особый порядок (п.57)."
-    ),
-    # Если у тебя поддерживается long_template — будет аккуратный «Подробный вывод»
-    "long_template": (
-        "Если до достижения пенсионного возраста осталось ≤ 4 лет, вы освобождаетесь от прохождения процедуры аттестации; "
-        "имеющаяся категория сохраняется до наступления пенсии (п.30). "
-        "Если вы уже достигли пенсионного возраста и продолжаете работать, применяется порядок п.57 "
-        "(как правило, освобождение от ОЗП и проведение комплексного обобщения результатов деятельности)."
-    )
-
+        ),
+        "long_template": (
+            "Если до достижения пенсионного возраста осталось ≤ 4 лет, вы освобождаетесь от прохождения процедуры аттестации; "
+            "имеющаяся категория сохраняется до наступления пенсии (п.30). "
+            "Если вы уже достигли пенсионного возраста и продолжаете работать, применяется порядок п.57 "
+            "(как правило, освобождение от ОЗП и проведение комплексного обобщения результатов деятельности)."
+        )
+    },
+    "general": {
+        "primary": [],
+        "secondary": [],
+        "max_citations": 3,
+        "short_template": "{fallback_short}"
     },
 }
 def build_short_answer(policy: dict | None, ctx: dict, fallback_short: str) -> str:
@@ -312,21 +343,53 @@ def _human_cat(category_key: Optional[str]) -> Tuple[str, str]:
     return (human, sp)
 
 # ─────────── Slot-extractors (универсальные извлекатели фактов) ───────────
-def extract_threshold_percent_from_p39(punkts: List[Dict[str,Any]]) -> Optional[str]:
-    import re
+def extract_threshold_percent_from_p39_for_category(punkts: List[Dict[str,Any]], category_key: Optional[str]) -> Optional[str]:
+    if not category_key:
+        return None
+
+    want = {
+        "модератор":    ("модератор", "moderator", "moderat"),
+        "эксперт":      ("эксперт", "expert", "ekspert"),
+        "исследовател": ("исследовател", "исследователь", "issled"),
+        "мастер":       ("мастер", "master"),
+    }
+    target_syns = want.get(category_key, ())
+    if not target_syns:
+        return None
+
+    text39 = None
     for p in punkts:
         if str(p.get("punkt_num","")).strip() == "39":
-            t = (p.get("text") or "")
-            # ищем числа %; если нет — словесное "восемьдесят"
-            perc = re.findall(r'(\d{1,3})\s*%', t)
-            if perc:
-                # берём максимальный процент, чтобы не промахнуться по формулировкам
-                try:
-                    m = max(int(x) for x in perc)
-                    return f"{m}%"
-                except Exception:
-                    return perc[-1] + "%"
-            if "восемьдесят процент" in t.lower(): return "80%"
+            text39 = (p.get("text") or ""); break
+    if not text39:
+        return None
+
+    tl = text39.lower().replace("ё","е")
+    pat_map = {
+        "модератор":    r"(педагог[\-\s]*модератор[^0-9%]{0,80}?(\d{1,3})\s*%)",
+        "эксперт":      r"(педагог[\-\s]*эксперт[^0-9%]{0,80}?(\d{1,3})\s*%)",
+        "исследовател": r"(педагог[\-\s]*исслед[^0-9%]{0,80}?(\d{1,3})\s*%)",
+        "мастер":       r"(педагог[\-\s]*мастер[^0-9%]{0,80}?(\d{1,3})\s*%)",
+    }
+    m = re.search(pat_map.get(category_key, ""), tl, flags=re.I)
+    if m:
+        try:
+            return f"{int(m.group(2))}%"
+        except Exception:
+            pass
+
+    positions = [tl.find(s) for s in target_syns if tl.find(s) != -1]
+    if not positions:
+        return None
+    pos = min(positions)
+    start = max(0, pos - 250); end = min(len(tl), pos + 250)
+    window = tl[start:end]
+    nums = [int(x) for x in re.findall(r"(\d{1,3})\s*%", window)]
+    if nums:
+        for pval in (60, 70, 80, 90):
+            if pval in nums:
+                return f"{pval}%"
+        return f"{max(nums)}%"
     return None
 
 def build_procedure_tail_if_p10(punkts: List[Dict[str,Any]]) -> str:
@@ -431,10 +494,15 @@ def enforce_short_answer_policy(question: str,
                                 intent_info: Dict[str,Any]) -> Dict[str,Any]:
     intent = intent_info.get("intent","general")
     category_key = intent_info.get("category")
+    human, sp = _human_cat(category_key)
+
+    def _is_category_q() -> bool:
+        return bool(category_key)
+
+    # базовый короткий ответ из политики
     policy = POLICIES.get(intent, POLICIES["general"])
     templ = policy.get("short_template","{fallback_short}")
 
-    human, sp = _human_cat(category_key)
     facts = {
         "cat_human": human,
         "cat_sp": sp,
@@ -443,14 +511,27 @@ def enforce_short_answer_policy(question: str,
             or extract_threshold_percent_from_p39(punkts)
             or "80%"
         ),
-
         "procedure_tail": build_procedure_tail_if_p10(punkts)
     }
 
+    # ВАЖНО: процент и «хвост этапов» показываем ТОЛЬКО для threshold/category
+    if intent not in {"threshold", "category_requirements"}:
+        facts["threshold_percent"] = ""
+        facts["procedure_tail"] = ""
+
     fallback = (data.get("short_answer") or "По общим правилам.").strip()
     sa = templ.format(fallback_short=fallback, **facts).strip()
+
+    # Доп. выравнивание
+    if _is_category_q() and "см. п." not in sa:
+        pn, spn = CAT_CANON.get(category_key, ("",""))
+        tag = f" (см. п. {pn}.{spn})" if pn and spn else ""
+        if tag and len(sa) + len(tag) <= 200:
+            sa += tag
+
     data["short_answer"] = sa[:200]
     return data
+
 
 
 
@@ -510,9 +591,12 @@ KW_EXCEPTION_TERMS = (
 )
 KW_FOREIGN_TERMS = (
     "зарубеж", "за пределами республики казахстан", "за границ",
-    "иностран", "nazarbayev university", "болаш",
+    "иностран", "nazarbayev university", "болаш", "болашақ",
 )
-KW_PERIOD_TERMS = ("каждые пять лет", "не реже одного раза в пять лет", "периодичност", "оплат", "стоимост", "количеств", "попыток")
+KW_PERIOD_TERMS = ("каждые пять лет", "не реже одного раза", "периодичност", "раз в пять лет", "один раз в три года")
+KW_FEE_TERMS = ("оплат", "плат", "стоимост", "бесплат", "госпошлин", "сбор")
+KW_COMMISSION_TERMS = ("комисси", "состав", "члены комис", "комиссия по аттестации")
+KW_PUBLICATION_TERMS = ("публикац", "журнал", "стать", "scopus", "web of science", "wos", "doi", "рекомендован")
 
 def kw_boost(question: str, doc_text: str) -> float:
     ql = (question or "").lower().replace("ё", "е")
@@ -521,33 +605,39 @@ def kw_boost(question: str, doc_text: str) -> float:
     boost = 0.0
     is_category_q = any(any(s in ql for s in syns) for syns in CATEGORY_SYNONYMS.values())
 
-
-    # зарубеж/магистратура — вытаскиваем исключения и «Болашак»
-    foreign_q = any(k in ql for k in ("магист", "за рубеж", "за границ", "зарубеж", "иностран"))
+    foreign_q = any(k in ql for k in ("магист", "за рубеж", "за границ", "зарубеж", "иностран", "болаш", "болашақ"))
     if foreign_q and not is_category_q:
         if any(k in dl for k in KW_EXCEPTION_TERMS):
             boost += 0.6
         if any(k in dl for k in KW_FOREIGN_TERMS):
             boost += 0.6
 
-    # общая льгота «без прохождения…» немного бустим,
-    # но если вопрос про категорию — наоборот, приглушаем, чтобы не путать
     has_exception_phrase = any(k in dl for k in KW_EXCEPTION_TERMS)
     if has_exception_phrase:
         boost += 0.3
         if is_category_q:
             boost -= 0.6
 
-    # антишум: когда спрашивают про категорию/зарубеж, а текст про оплату/периодичность
     if (is_category_q or foreign_q) and any(k in dl for k in KW_PERIOD_TERMS):
         boost -= 0.4
 
-    # !!! новенькое: при вопросах про категории — бустим документы, где есть ОЗП/порог (п.39 и близко)
     if is_category_q and any(t in dl for t in KW_OZP_TERMS):
         boost += 0.5
 
-    return boost
+    # новые сигналы:
+    if any(k in ql for k in ("платить","оплат","стоимост","бесплат","сбор","госпошлин")) and any(k in dl for k in KW_FEE_TERMS):
+        boost += 0.7
 
+    if any(k in ql for k in ("кто входит","состав комиси","состав комис","члены комис","комиссия")) and any(k in dl for k in KW_COMMISSION_TERMS):
+        boost += 0.6
+
+    if any(k in ql for k in ("публикац","журнал","стать","scopus","wos","web of science","doi")) and any(k in dl for k in KW_PUBLICATION_TERMS):
+        boost += 0.6
+
+    if any(k in ql for k in ("как часто","периодич","каждые пять лет","раз в пять лет","один раз в три года","1 раз в 3 года")) and any(k in dl for k in KW_PERIOD_TERMS):
+        boost += 0.6
+
+    return boost
 
    
 
@@ -1303,14 +1393,12 @@ def enforce_short_answer(question: str, data: dict, ctx_text: str) -> dict:
     return data
 
 
-def ensure_min_citations(question: str, data: Dict[str, Any], punkts: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Гарантирует минимум 2 релевантные цитаты.
-    Для категорий — п.5.<канон> → п.10 → п.39.
-    Для зарубеж/магистратуры — п.32 → п.10 (если есть в контексте).
-    Иначе — первые 2 из выданного контекста (без 3 и 41).
-    """
+def ensure_min_citations_policy(question: str,
+                                data: Dict[str,Any],
+                                punkts: List[Dict[str,Any]],
+                                intent_info: Dict[str,Any]) -> Dict[str,Any]:
     ql = (question or "").lower().replace("ё", "е")
+    intent = intent_info.get("intent","general")
     cits = [dict(c) for c in (data.get("citations") or [])]
 
     def _exists_in_context(pn: str, sp: str = "") -> Optional[Dict[str, str]]:
@@ -1319,20 +1407,18 @@ def ensure_min_citations(question: str, data: Dict[str, Any], punkts: List[Dict[
                 return {"punkt_num": pn, "subpunkt_num": sp, "quote": ""}
         return None
 
-    # выкинем 3/41
-    cits = [c for c in cits if str(c.get("punkt_num","")).strip() not in {"3","41"}]
+    # выкинем 3/41 для всех, КРОМЕ fee (где п.41 критичен)
+    skip = {"3"} if intent == "fee" else {"3","41"}
+    cits = [c for c in cits if str(c.get("punkt_num","")).strip() not in skip]
 
-    # если уже >=2 цитат — оставим как есть
     if len(cits) >= 2:
         data["citations"] = cits[:3]
         return data
 
-    # определяем, это категория или "зарубеж"
     target = None
     for key, syns in CATEGORY_SYNONYMS.items():
         if any(s in ql for s in syns):
-            target = key
-            break
+            target = key; break
 
     need: List[Dict[str, str]] = []
 
@@ -1344,19 +1430,21 @@ def ensure_min_citations(question: str, data: Dict[str, Any], punkts: List[Dict[
         for pn in ("10","39"):
             hit = _exists_in_context(pn, "")
             if hit: need.append(hit)
-    elif any(k in ql for k in ("магист","зарубеж","за границ","иностран","болаш","bolash","nazarbayev")):
+    elif intent == "exemption_foreign":
         hit32 = _exists_in_context("32","")
         if hit32: need.append(hit32)
         hit10 = _exists_in_context("10","")
         if hit10: need.append(hit10)
+    elif intent == "fee":
+        hit41 = _exists_in_context("41","")
+        if hit41: need.append(hit41)
 
-    # если всё ещё пусто — возьмём первые 2 пункта из контекста (кроме 3/41)
     if not need:
         seen = set()
         for p in punkts:
             pn = str(p.get("punkt_num","")).strip()
             sp = str(p.get("subpunkt_num","")).strip()
-            if pn in {"3","41"}: 
+            if pn in skip: 
                 continue
             key = (pn, sp)
             if key in seen:
@@ -1366,7 +1454,6 @@ def ensure_min_citations(question: str, data: Dict[str, Any], punkts: List[Dict[
             if len(need) >= 2:
                 break
 
-    # склеим need + уже существующие (сохраняя порядок и убирая дубли)
     out: List[Dict[str, str]] = []
     seen_keys = set()
     for c in need + cits:
@@ -1379,10 +1466,6 @@ def ensure_min_citations(question: str, data: Dict[str, Any], punkts: List[Dict[
 
     data["citations"] = out[:3]
     return data
-
-
-
-
 # ───────────────────── Пост-процесс и рендер ────────────────────
 
 def _collapse_repeats(text: str) -> str:
@@ -1412,17 +1495,10 @@ def _collapse_repeats(text: str) -> str:
     return re.sub(r"[ \t]+", " ", s).strip()
 
 
-def validate_citations(citations: List[Dict[str, Any]], punkts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Нормализует цитаты:
-    - оставляет только те, что реально есть в выданном контексте;
-    - выкидывает п.3 и п.41 как «доказательство»;
-    - сохраняет переносы строк;
-    - обрезает текст по лимиту (длиннее для п.5.x);
-    - удаляет повторы и «мусорные» дубликаты;
-    - лимит до 8.
-    """
-    SKIP_AS_EVIDENCE = {"3", "41"}
+def validate_citations(citations: List[Dict[str, Any]],
+                       punkts: List[Dict[str, Any]],
+                       allow_p41: bool = False) -> List[Dict[str, Any]]:
+    SKIP_AS_EVIDENCE = {"3"} if allow_p41 else {"3","41"}
 
     allowed_keys = {(str(p.get("punkt_num","")).strip(), str(p.get("subpunkt_num","")).strip()) for p in punkts}
     by_key = {
@@ -1436,7 +1512,6 @@ def validate_citations(citations: List[Dict[str, Any]], punkts: List[Dict[str, A
         sp = str(c.get("subpunkt_num","")).strip()
         if not pn or pn in SKIP_AS_EVIDENCE or (pn, sp) not in allowed_keys:
             continue
-
         base = by_key.get((pn, sp), "")
         if not base.strip():
             continue
@@ -1452,7 +1527,6 @@ def validate_citations(citations: List[Dict[str, Any]], punkts: List[Dict[str, A
 
         out.append({"punkt_num": pn, "subpunkt_num": sp, "quote": good})
 
-    # дедуп по (pn, sp, quote)
     seen: set[Tuple[str,str,str]] = set(); uniq: List[Dict[str, Any]] = []
     for c in out:
         key = (c["punkt_num"], c["subpunkt_num"], c["quote"])
@@ -1514,31 +1588,21 @@ def _ensure_category_citation(question: str,
 def filter_citations_by_question(
     question: str,
     citations: List[Dict[str, Any]],
-    punkts: List[Dict[str, Any]]
+    punkts: List[Dict[str, Any]],
+    intent: str = "general"
 ) -> List[Dict[str, Any]]:
-    """
-    Релевантность и порядок:
-    — Зарубеж/магистратура: п.32 первым, максимум 1–2 цитаты.
-    — Пенсионеры: порядок — п.30 → п.57 → прочее (1–2 цитаты).
-    — Категория: порядок — п.5.канон → прочие п.5 → п.10 → п.39 (до 3 цитат)
-      и нарезка цитаты из п.5 строго вокруг целевой категории.
-    — Пункты 3 и 41 как «доказательство» — выкидываем.
-    — По умолчанию: до 3 цитат с аккуратной нарезкой.
-    """
     import re
 
     ql = (question or "").lower().replace("ё", "е")
     if not citations:
         return citations
 
-    # Карта текстов для выданного контекста
     by_key_full = {
         (str(p.get("punkt_num","")).strip(), str(p.get("subpunkt_num","")).strip()): (p.get("text") or "")
         for p in punkts
     }
     by_key = {k: v.lower().replace("ё","е") for k, v in by_key_full.items()}
 
-    # helper — обрезка вокруг ключевых слов с аккуратными границами
     def _crop_around(text_full: str, keys, width: int = QUOTE_WIDTH_DEFAULT) -> str:
         tf = re.sub(r"[ \t]+", " ", text_full or "").strip().replace("\u00A0", " ")
         tl = tf.lower().replace("ё", "е")
@@ -1557,22 +1621,18 @@ def filter_citations_by_question(
         snippet = snippet.lstrip(" ;,.:—-–•").rstrip(" ,;:")
         return snippet[:width] + ("…" if len(snippet) > width else "")
 
-    # remove 3/41
-    clean = [c for c in citations if str(c.get("punkt_num","")).strip() not in {"3","41"}]
+    # remove 3/(41) — для fee оставляем 41
+    remove = {"3"} if intent == "fee" else {"3","41"}
+    clean = [c for c in citations if str(c.get("punkt_num","")).strip() not in remove]
     if not clean:
         clean = citations[:]
 
     # foreign?
-    if any(k in ql for k in ("магист","зарубеж","за границ","иностран","болаш","bolash","nazarbayev")):
+    if intent == "exemption_foreign":
         p32 = [c for c in clean if str(c.get("punkt_num","")).strip() == "32"]
         rest = [c for c in clean if str(c.get("punkt_num","")).strip() != "32"]
-        pref_terms = ("учен", "учёная", "степен", "phd", "кандид", "доктор",
-              "перечень рекомендованных", "nazarbayev", "болаш",
-              "без прохождения")
-        def _rel(c):
-            key = (str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip())
-            return any(t in by_key.get(key, "") for t in pref_terms)
-        ordered = p32 + sorted(rest, key=lambda c: (not _rel(c)))
+        pref_terms = ("учен", "учёная", "степен", "phd", "кандид", "доктор", "перечень рекомендованных", "nazarbayev", "болаш", "без прохождения")
+        ordered = p32 + rest
         out = (ordered[:2] or clean[:2])
         for c in out:
             key = (str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip())
@@ -1582,11 +1642,11 @@ def filter_citations_by_question(
         return out
 
     # retirement?
-    if any(k in ql for k in ("пенсион", "работающий пенсионер", "до пенсии")):
+    if intent == "exemption_retirement":
         p30 = [c for c in clean if str(c.get("punkt_num","")).strip() == "30"]
         p57 = [c for c in clean if str(c.get("punkt_num","")).strip() == "57"]
         rest = [c for c in clean if c not in (p30 + p57)]
-        out = (p30 + p57 + rest)[:2]  # обычно 1–2 цитаты достаточно
+        out = (p30 + p57 + rest)[:2]
         for c in out:
             key = (str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip())
             base_full = by_key_full.get(key, "")
@@ -1602,16 +1662,6 @@ def filter_citations_by_question(
             break
 
     if target:
-        # ensure p.10 and p.39 exist in context
-        def _exists_p(pn: str) -> Optional[Tuple[str, str, str]]:
-
-
-            for (kpn, ksp), t in by_key_full.items():
-                if kpn == pn:
-                    return (pn, ksp, t)
-            return None
-
-        # сортировка: п.5.канон -> прочие п.5 -> 10 -> 39 -> остальное
         canon_sp = CAT_CANON.get(target, ("",""))[1]
         def _ord(c):
             pn = str(c.get("punkt_num","")).strip()
@@ -1625,40 +1675,35 @@ def filter_citations_by_question(
         clean.sort(key=_ord)
         out = clean[:3]
 
-        # если 10/39 отсутствуют, но есть в контексте — добавим
         have = {(str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip()) for c in out}
         for pn in ("10","39"):
             if not any(h[0] == pn for h in have):
-                hit = _exists_p(pn)
-                if hit:
-                    pn_, sp_, txt_ = hit
-                    out.append({"punkt_num": pn_, "subpunkt_num": sp_, "quote": ""})
+                for (kpn, ksp), txt in by_key_full.items():
+                    if kpn == pn:
+                        out.append({"punkt_num": kpn, "subpunkt_num": ksp, "quote": ""}); break
 
-        # ключи для точного скоупа внутри п.5.x
         human = CATEGORY_LABEL.get(target, target)
-        cat_keys = tuple(set(CATEGORY_SYNONYMS.get(target, ())) | {
+        cat_keys = tuple({
             f"педагог-{target}", f"педагог {target}",
-            f"педагог-{human}", f"педагог {human}", human
+            f"педагог-{human}", f"педагог {human}",
+            target, human
         })
 
-        # финальная нарезка по типам пунктов
         for c in out:
             key = (str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip())
             base_full = by_key_full.get(key, "")
-            if not base_full:
+            if not base_full: 
                 continue
             pn = key[0]
             if pn == "5":
                 width = QUOTE_WIDTH_LONG
                 snippet = _crop_around(base_full, cat_keys, width=width)
                 tl = snippet.lower().replace("ё","е")
-                # если всё ещё нет упоминания — возьмём первое предложение, где встречается ключ
-                if not any(k.replace("ё","е") in tl for k in cat_keys):
+                if not any(k in tl for k in cat_keys):
                     for sent in re.split(r"(?<=[\.\!\?])\s+", base_full):
                         sl = (sent or "").lower().replace("ё","е")
                         if any(k in sl for k in cat_keys):
-                            snippet = sent[:width] + ("…" if len(sent) > width else "")
-                            break
+                            snippet = sent[:width] + ("…" if len(sent) > width else ""); break
                 c["quote"] = _collapse_repeats(snippet)
             elif pn == "10":
                 keys10 = ("заявлен", "портфолио", "озп", "обобщен", "комисси")
@@ -1666,27 +1711,33 @@ def filter_citations_by_question(
             elif pn == "39":
                 perc = (extract_threshold_percent_from_p39_for_category(punkts, target)
                         or extract_threshold_percent_from_p39(punkts))
+                keys39 = ()
                 if perc:
                     num = re.search(r"\d{1,3}", perc).group(0)
                     keys39 = (perc, f"{num} %", f"{num}\u00A0%")
-                else:
-                    keys39 = ()
                 c["quote"] = _collapse_repeats(_crop_around(base_full, keys39, width=QUOTE_WIDTH_DEFAULT))
             else:
                 c["quote"] = _collapse_repeats(_crop_around(base_full, tuple(), width=QUOTE_WIDTH_DEFAULT))
-
         return out[:3]
 
-    # default: просто до 3 цитат и аккуратная нарезка
+    # fee — просто до 2 релевантных, не выкидывая 41
+    if intent == "fee":
+        out = clean[:2]
+        for c in out:
+            key = (str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip())
+            base_full = by_key_full.get(key, "")
+            if base_full:
+                c["quote"] = _collapse_repeats(_crop_around(base_full, ("оплат","плат", "стоимост", "бесплат"), width=QUOTE_WIDTH_DEFAULT))
+        return out
+
+    # default
     out = clean[:3]
     for c in out:
         key = (str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip())
         base_full = by_key_full.get(key, "")
         if base_full:
             c["quote"] = _collapse_repeats(_crop_around(base_full, tuple(), width=QUOTE_WIDTH_DEFAULT))
-    return out
-
-def enforce_reasoned_answer(question: str, data: Dict[str, Any], punkts: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return outdef enforce_reasoned_answer(question: str, data: Dict[str, Any], punkts: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Для вопросов про категорию:
     — короткий маркированный список (2–6 пунктов) компетенций из канонического п.5.x;
@@ -1773,6 +1824,29 @@ def enforce_policy_reasoned_answer(question: str,
     else:
         data["reasoned_answer"] = ra
 
+    return data
+# ── Вставить сразу после enforce_policy_reasoned_answer ──
+def sanitize_numeric_claims(data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Убираем числовые заявления (напр. «7 баллов») из reasoned/short,
+    если такие числа не встречаются в процитированных отрывках.
+    Оставляем проценты для threshold/category.
+    """
+    ra = (data.get("reasoned_answer") or "")
+    sa = (data.get("short_answer") or "")
+    ctext = " ".join([c.get("quote","") for c in (data.get("citations") or [])]).lower()
+
+    def _clean_numbers(txt: str) -> str:
+        txt = re.sub(r"(\b)(\d{1,3})\s*(балл[а-я]*)",
+                     lambda m: (m.group(1) + m.group(3)) if m.group(2) not in ctext else m.group(0),
+                     txt, flags=re.I)
+        txt = re.sub(r"(\b)(\d{1,3})\s*(лет|года)",
+                     lambda m: (m.group(1) + m.group(3)) if m.group(2) not in ctext else m.group(0),
+                     txt, flags=re.I)
+        return txt
+
+    data["reasoned_answer"] = _clean_numbers(ra)
+    data["short_answer"] = _clean_numbers(sa)
     return data
 
 
@@ -1862,38 +1936,39 @@ def render_short_html(question: str, data: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 # Интенты, где «Связанные пункты» лучше скрыть, чтобы не шуметь
-INTENTS_HIDE_RELATED = {"threshold", "exemption_foreign", "exemption_retirement"}
+INTENTS_HIDE_RELATED = {"threshold", "exemption_foreign", "exemption_retirement", "fee", "periodicity"}
+
+
 
 def render_detailed_html(question: str, data: Dict[str, Any], punkts: List[Dict[str, Any]]) -> str:
     sa = html.escape(data.get("short_answer", "")).strip()
     ra = html.escape(data.get("reasoned_answer", "")).strip()
 
-    # ДО валидации: гарантируем, что при вопросе про категорию первая цитата — с нужной категорией
+    intent_info = classify_question(question)
+    intent = intent_info.get("intent", "general")
+
     data["citations"] = _ensure_category_citation(question, data.get("citations", []), punkts)
 
-    citations = validate_citations(data.get("citations", []), punkts)
-    citations = filter_citations_by_question(question, citations, punkts)
+    citations = validate_citations(data.get("citations", []), punkts, allow_p41=(intent=="fee"))
+    citations = filter_citations_by_question(question, citations, punkts, intent=intent)
 
-    intent = classify_question(question).get("intent", "general")
-
-    # related: только если не шумит под конкретный интент
     have_cit = {(str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip()) for c in citations}
     related = data.get("related", []) or []
 
-    if intent not in INTENTS_HIDE_RELATED:
-        def _exists(pn: str, sp: str = "") -> bool:
-            for p in punkts:
-                if str(p.get("punkt_num","")).strip()==pn and (sp=="" or str(p.get("subpunkt_num","")).strip()==sp):
-                    return True
-            return False
-        def _push(pn: str, sp: str = "") -> None:
-            if (pn, sp) not in have_cit:
-                related.append({"punkt_num": pn, "subpunkt_num": sp})
+    # related: без шума. п.39 — только для threshold/категорий; п.63 — только для «commission»
+    def _exists(pn: str, sp: str = "") -> bool:
+        for p in punkts:
+            if str(p.get("punkt_num","")).strip()==pn and (sp=="" or str(p.get("subpunkt_num","")).strip()==sp):
+                return True
+        return False
+    def _push(pn: str, sp: str = "") -> None:
+        if (pn, sp) not in have_cit:
+            related.append({"punkt_num": pn, "subpunkt_num": sp})
 
-        # Добавим п.39, если был в контексте и его нет среди цитат
-        if _exists("39"): _push("39","")
+    if intent in {"threshold", "category_requirements"} and _exists("39"):
+        _push("39","")
 
-        # И один первый подпункт п.63, если встречался в контексте
+    if intent == "commission":
         for p in punkts:
             if str(p.get("punkt_num","")).strip()=="63":
                 _push("63", str(p.get("subpunkt_num","")).strip())
@@ -1913,7 +1988,7 @@ def render_detailed_html(question: str, data: Dict[str, Any], punkts: List[Dict[
             pn = c.get("punkt_num", "")
             sp = c.get("subpunkt_num", "")
             head = f"п. {pn}{('.' + sp) if sp else ''}".strip()
-            qt = html.escape(c.get("quote", ""))  # Telegram понимает \n, но не <br>
+            qt = html.escape(c.get("quote", ""))
             lines.append(f"— <i>{head}</i>:\n{qt}")
     if related:
         lines.append("<b>Связанные пункты:</b>")
@@ -1924,8 +1999,6 @@ def render_detailed_html(question: str, data: Dict[str, Any], punkts: List[Dict[
             lines.append(f"• {head}")
 
     return "\n".join(lines).strip()
-
-
 def render_related(intent: str, related_items: list[str]) -> str:
     if intent in INTENTS_HIDE_RELATED:
         return ""
@@ -2055,61 +2128,41 @@ async def handle_webhook(request: web.Request) -> web.Response:
    
 
     async with lock:
-        try:
-            # 0) Интент
-            intent_info = classify_question(text)
-            logger.info("intent=%s cat=%s", intent_info.get("intent"), intent_info.get("category"))
+    try:
+        # 0) Интент
+        intent_info = classify_question(text)
+        logger.info("intent=%s cat=%s", intent_info.get("intent"), intent_info.get("category"))
 
-            # 1) must-have по политике в retrieve (ОДИН раз)
-            policy_pairs = policy_get_must_have_pairs(intent_info)
-            logger.info("policy_pairs=%s", policy_pairs)
-            punkts = await run_blocking(rag_search, text, must_have_pairs=policy_pairs)
-            logger.info("top_punkts=%s", [(p.get('punkt_num'), p.get('subpunkt_num')) for p in punkts[:10]])
+        # 1) must-have по политике
+        policy_pairs = policy_get_must_have_pairs(intent_info)
+        logger.info("policy_pairs=%s", policy_pairs)
+        punkts = await run_blocking(rag_search, text, must_have_pairs=policy_pairs)
+        logger.info("top_punkts=%s", [(p.get('punkt_num'), p.get('subpunkt_num')) for p in punkts[:10]])
 
-            # 2) LLM
-            data_struct = await run_blocking(ask_llm, text, punkts)
+        # 2) LLM
+        data_struct = await run_blocking(ask_llm, text, punkts)
 
-            # 3) Политика: минимум цитат и краткий ответ
-            data_struct = ensure_min_citations_policy(text, data_struct, punkts, intent_info)
-            data_struct = enforce_short_answer_policy(text, data_struct, punkts, intent_info)
+        # 3) Политика: минимум цитат и краткий ответ
+        data_struct = ensure_min_citations_policy(text, data_struct, punkts, intent_info)
+        data_struct = enforce_short_answer_policy(text, data_struct, punkts, intent_info)
 
-            # 4) Буллеты — только для категории
-            if intent_info.get("intent") == "category_requirements":
-                data_struct = enforce_reasoned_answer(text, data_struct, punkts)
+        # 4) Буллеты — только для категории
+        if intent_info.get("intent") == "category_requirements":
+            data_struct = enforce_reasoned_answer(text, data_struct, punkts)
 
-            # 4a) Выравнивание «подробного ответа» по политике (пенсионеры/зарубеж)
-            data_struct = enforce_policy_reasoned_answer(text, data_struct, intent_info)
+        # 4a) Политическое выравнивание
+        data_struct = enforce_policy_reasoned_answer(text, data_struct, intent_info)
 
-            # HTML
-            short_html = render_short_html(text, data_struct)
-            detailed_html = render_detailed_html(text, data_struct, punkts)
+        # 4b) Санитайз чисел
+        data_struct = sanitize_numeric_claims(data_struct)
 
-            # отправляем short; если длиннее — разбиваем
-            if len(short_html) <= 4000:
-                msg_id = await run_blocking(tg_send_message, chat_id, short_html, reply_markup=kb_show_detailed())
-            else:
-                parts = split_for_telegram(short_html, 4000)
-                msg_id = await run_blocking(tg_send_message, chat_id, parts[0], reply_markup=kb_show_detailed())
-                for extra in parts[1:]:
-                    await run_blocking(tg_send_message, chat_id, extra)
-
-            if msg_id:
-                key = (int(chat_id), int(msg_id))
-                LAST_RESPONSES[key] = {
-                    "message_id": int(msg_id),
-                    "short_html": short_html,
-                    "detailed_html": detailed_html,
-                }
-                if len(LAST_RESPONSES) > 200:
-                    FIRST = next(iter(LAST_RESPONSES))
-                    if FIRST != key:
-                        LAST_RESPONSES.pop(FIRST, None)
-
-            await run_blocking(log_to_sheet_safe, chat_id, text, data_struct.get("short_answer", ""))
-
-        except Exception:
-            logger.exception("Processing failed")
-            await run_blocking(tg_send_message, chat_id, "Произошла ошибка при обработке запроса. Попробуйте позже.")
+        # 5) HTML и отправка
+        short_html = render_short_html(text, data_struct)
+        detailed_html = render_detailed_html(text, data_struct, punkts)
+        ...
+    except Exception:
+        logger.exception("Processing failed")
+        await run_blocking(tg_send_message, chat_id, "Произошла ошибка при обработке запроса. Попробуйте позже.")
 
     return web.Response(text="ok")
 # ─────────────────────────── main() ─────────────────────────────
