@@ -31,7 +31,8 @@ webhook_main.py — чистая версия (готовая к подстан�
     TELEGRAM_WEBHOOK_SECRET       # секрет заголовка X-Telegram-Bot-Api-Secret-Token
     EMBEDDINGS_PATH               # default: embeddings.npy
     PUNKTS_PATH                   # default: pravila_detailed_tagged_autofix.json
-    EMBEDDING_MODEL               # default: text-embedding-ada-002 (совместим с текущим embeddings.npy)
+    EMBEDDING_MODEL  # default: text-embedding-3-large (автопереключение на text-embedding-ada-002 для 1536-мерных embeddings.npy)
+
     CHAT_MODEL                    # default: gpt-4o-mini
     MULTI_QUERY                   # "1" → включить Мульти-переформулировки (дороже)
     SHEET_ID, GOOGLE_CREDENTIALS_JSON  # если хотите логировать вопросы/ответы в Google Sheets
@@ -177,14 +178,14 @@ INTENT_KEYWORDS = {
         "сколько процентов", "сколько баллов", "надо набрать"
     ),
     "fee": ("платить", "оплат", "стоимост", "платно", "бесплатн", "сбор", "госпошлин", "оплата"),
-    "periodicity": ("как часто", "периодич", "каждые пять лет", "раз в пять лет", "1 раз в 5 лет", "один раз в три года", "1 раз в 3 года", "частота"),
-    "commission": ("кто входит", "кто входить", "состав комис", "члены комис", "комиссия по аттестации", "кто в комисси"),
-    # должно быть:
-    "publications": ("публикац", "журнал", "стат", "scopus", "web of science","wos", "doi", "индексир", "рекомендован"),
-
-
-
-    "procedure": ("как сдать", "как проходит", "этап", "этапы", "заявлен", "подать", "портфолио", "комисси", "обобщен"),
+    "periodicity": ("как часто", "периодич", "каждые пять лет", "раз в пять лет",
+                    "1 раз в 5 лет", "один раз в три года", "1 раз в 3 года", "частота"),
+    "commission": ("кто входит", "кто входить", "состав комис", "члены комис",
+                   "комиссия по аттестации", "кто в комисси"),
+    "publications": ("публикац", "журнал", "стат", "scopus", "web of science",
+                     "wos", "doi", "индексир", "рекомендован"),
+    "procedure": ("как сдать", "как проходит", "этап", "этапы", "заявлен", "подать",
+                  "портфолио", "комисси", "обобщен"),
     "exemption_foreign": (
         "болаш", "болаша", "болашақ", "bolash",
         "nazarbayev", "nazarbayev university",
@@ -194,16 +195,13 @@ INTENT_KEYWORDS = {
         "магистратур", "докторантур", "phd",
         "кандидат наук", "доктор наук", "ученая степень", "учёная степень"
     ),
-    # возле INTENT_KEYWORDS["exemption_retirement"]
     "exemption_retirement": (
-    "пенсионер", "работающий пенсионер", "пенсионного возраста",
-    "до пенсии", "осталось до пенсии", "возраст"
+        "пенсионер", "работающий пенсионер", "пенсионного возраста",
+        "до пенсии", "осталось до пенсии", "возраст"
     ),
+}
 
 
-    # в classify_question, сразу после exemption_retirement, вставь спец-правило:
-    if ("возраст" in ql or re.search(r"\b\d+\s*(год|лет|года)\b", ql)) and "аттест" in ql:
-        return {"intent": "exemption_retirement", "category": None, "confidence": 0.9}
 
 
 def _detect_category_key(q: str) -> Optional[str]:
@@ -220,6 +218,14 @@ def classify_question(q: str) -> Dict[str, Any]:
     # Приоритет: пенсионеры → зарубеж/льготы → оплата → периодичность → комиссия → публикации → порог → категория → процедура → general
     if any(k in ql for k in INTENT_KEYWORDS["exemption_retirement"]):
         return {"intent": "exemption_retirement", "category": None, "confidence": 0.9}
+        # Спец-правило: упомянут возраст/кол-во лет + "аттест" → пенсионный кейс
+    if ("возраст" in ql or re.search(r"\b\d+\s*(?:год|лет|года)\b", ql)) and "аттест" in ql:
+        return {"intent": "exemption_retirement", "category": None, "confidence": 0.9}
+
+    # Спец-правило: если в вопросе фигурирует возраст/кол-во лет и упомянута аттестация — это пенсионный кейс
+    if ("возраст" in ql or re.search(r"\b\d+\s*(?:год|лет|года)\b", ql)) and "аттест" in ql:
+        return {"intent": "exemption_retirement", "category": None, "confidence": 0.9}
+
     # 🔽 ДОБАВИТЬ ВОТ ЭТО СПЕЦ-ПРАВИЛО
     if re.search(r"\b\d+\s*(?:год|лет|года)\b", ql) and "аттест" in ql:
         return {"intent": "exemption_retirement", "category": None, "confidence": 0.9}
@@ -284,7 +290,7 @@ POLICIES = {
         "short_template": "По общим правилам: периодичность прохождения установлена Правилами; см. цитаты ниже."
     },
     "commission": {
-        "primary": [],                 # было [("63","")]
+        "primary": [("63","")],  # было []
         "secondary": [],
         "max_citations": 2,
         "short_template": "Состав аттестационной комиссии определяется Правилами; см. цитаты ниже."
@@ -1118,7 +1124,10 @@ def narrow_punkts_by_intent(question: str, punkts: List[Dict[str, Any]]) -> List
     if intent == "commission":
         keys = ("комисси", "состав", "члены комис")
         keep = [p for p in punkts if any(k in (p.get("text","").lower()) for k in keys)]
+        p63 = [p for p in punkts if _pn(p) == "63"]
+        keep = (p63 + keep) if p63 else keep
         return (keep or punkts)[:12]
+
 
 
     if intent == "fee":
@@ -1649,11 +1658,7 @@ def filter_citations_by_question(
     clean = [c for c in citations if str(c.get("punkt_num","")).strip() not in remove]
     if not clean:
         clean = citations[:]
-    # remove 3/(41) — для fee оставляем 41
-    remove = {"3"} if intent == "fee" else {"3","41"}
-    clean = [c for c in citations if str(c.get("punkt_num","")).strip() not in remove]
-    if not clean:
-        clean = citations[:]
+
 
     # 🔽 ДОБАВИТЬ: не тащим п.39, если вопрос не про порог/категории
     if intent not in {"threshold", "category_requirements"}:
@@ -2038,7 +2043,14 @@ def render_detailed_html(question: str, data: Dict[str, Any], punkts: List[Dict[
     if intent in {"threshold", "category_requirements"} and _exists("39"):
         _push("39","")
 
-    
+    if intent == "commission":
+        for p in punkts:
+            if str(p.get("punkt_num","")).strip() == "63":
+                _push("63", str(p.get("subpunkt_num","")).strip())
+                break
+
+
+
     data["related"] = related
 
     lines: List[str] = []
@@ -2055,7 +2067,7 @@ def render_detailed_html(question: str, data: Dict[str, Any], punkts: List[Dict[
             head = f"п. {pn}{('.' + sp) if sp else ''}".strip()
             qt = html.escape(c.get("quote", ""))
             lines.append(f"— <i>{head}</i>:\n{qt}")
-    if related:
+    if related and intent not in INTENTS_HIDE_RELATED:
         lines.append("<b>Связанные пункты:</b>")
         for r in related[:12]:
             pn = html.escape(str(r.get("punkt_num", "")))
