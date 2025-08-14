@@ -59,8 +59,15 @@ from aiohttp import web
 from collections import OrderedDict  # NEW
 
 # OpenAI v1 style
+# OpenAI v1 style (robust exceptions import)
 from openai import OpenAI
-from openai import APIStatusError, APIConnectionError, RateLimitError, APITimeoutError
+try:
+    # Некоторые версии SDK экспонируют APIStatusError; другие — APIError
+    from openai import APIStatusError as APIError  # SDK ≥1.0
+except Exception:
+    from openai import APIError  # fallback для иных сборок
+from openai import APIConnectionError, RateLimitError, APITimeoutError
+
 
 
 # Опционально: лемматизация RU
@@ -202,9 +209,10 @@ INTENT_KEYWORDS = {
     ),
     "exemption_retirement": (
         "пенсионер", "работающий пенсионер", "пенсионного возраста",
-        "до пенсии", "осталось до пенсии", "возраст"
+        "до пенсии", "осталось до пенсии", "возраст", "лет", "года"
     ),
 }
+
 
 
 
@@ -221,45 +229,39 @@ def classify_question(q: str) -> Dict[str, Any]:
     ql = (q or "").lower().replace("ё","е")
     cat = _detect_category_key(ql)
 
-    # Спец: возраст/пенсия
+    # Освобождения/пенсионные — в приоритете
     if any(k in ql for k in INTENT_KEYWORDS["exemption_retirement"]):
-        return {"intent": "exemption_retirement", "category": None, "confidence": 0.9}
-    if ("возраст" in ql or re.search(r"\b\d+\s*(?:год|лет|года)\b", ql)) and "аттест" in ql:
-        return {"intent": "exemption_retirement", "category": None, "confidence": 0.9}
+        if "аттест" in ql or "категор" in ql or "проход" in ql:
+            return {"intent": "exemption_retirement", "category": None, "confidence": 0.9}
 
-    # Спец: «можно ли не проходить аттестацию» → трактуем как вопрос об освобождении (п.30/п.57), а не о пороге
     if ("не проход" in ql or "освобож" in ql) and "аттест" in ql:
-        return {"intent": "exemption_retirement", "category": None, "confidence": 0.8}
+        return {"intent": "exemption_retirement", "category": None, "confidence": 0.85}
 
     # Иностранные/льготные основания (п.32)
     if any(k in ql for k in INTENT_KEYWORDS["exemption_foreign"]):
         return {"intent": "exemption_foreign", "category": None, "confidence": 0.9}
 
-    # Платность/бесплатность
+    # Оплата/частота/комиссия — явные интенты
     if any(k in ql for k in INTENT_KEYWORDS["fee"]):
         return {"intent": "fee", "category": None, "confidence": 0.9}
-
-    # Периодичность
     if any(k in ql for k in INTENT_KEYWORDS["periodicity"]):
         return {"intent": "periodicity", "category": None, "confidence": 0.85}
-
-    # Комиссия
     if any(k in ql for k in INTENT_KEYWORDS["commission"]):
         return {"intent": "commission", "category": None, "confidence": 0.85}
 
-    # >>> ВАЖНО: если есть упоминание категории И (что нужно/требования/критерии/портфолио/и т.п.) — это точно про требования категории
+    # Категория + явные триггеры требований
     if cat and any(t in ql for t in CATEGORY_TRIGGERS):
         return {"intent": "category_requirements", "category": cat, "confidence": 0.9}
 
-    # Публикации (если нет явного «вопроса о требованиях к категории»)
+    # Публикации (если не «требования к категории»)
     if any(k in ql for k in INTENT_KEYWORDS["publications"]):
-        return {"intent": "publications", "category": None, "confidence": 0.8}
+        return {"intent": "publications", "category": None, "confidence": 0.85}
 
     # Порог ОЗП
     if any(k in ql for k in INTENT_KEYWORDS["threshold"]):
         return {"intent": "threshold", "category": cat, "confidence": 0.9}
 
-    # Прочее: если категория всё-таки распознана — это про требования
+    # Остальное: если категория распознана — отнесём к требованиям
     if cat:
         return {"intent": "category_requirements", "category": cat, "confidence": 0.85}
 
@@ -292,38 +294,38 @@ POLICIES = {
         "primary": [("41","")],
         "secondary": [],
         "max_citations": 2,
-        "short_template": "По общим правилам: вопросы оплаты установлены Правилами; см. цитаты ниже."
+        "short_template": "Очередная — бесплатно 1 раз в год; повторная в тот же год — платно (п.41)."
     },
     "periodicity": {
-        "primary": [],
+        "primary": [],  # остаётся пустым, так как номер пункта в твоём массиве не фиксирован
         "secondary": [],
         "max_citations": 2,
         "short_template": "По общим правилам: периодичность прохождения установлена Правилами; см. цитаты ниже."
     },
     "commission": {
-        "primary": [],
+        "primary": [("21",""), ("20","")],  # приоритет: нечетное число/≥7 → состав и формирование
         "secondary": [],
-        "max_citations": 2,
+        "max_citations": 3,
         "short_template": "Состав аттестационной комиссии определяется Правилами; см. цитаты ниже."
     },
     "publications": {
-        "primary": [],
+        "primary": [("5","")],   # гарантируем наличие п.5 в цитатах
         "secondary": [("10","")],
         "max_citations": 2,
-        "short_template": "По общим правилам: публикации учитываются в портфолио при наличии соответствующих критериев (см. цитаты)."
+        "short_template": "По общим правилам: публикации учитываются в портфолио по критериям п.5."
     },
     "exemption_foreign": {
         "primary":   [("32","")],
         "secondary": [("10","")],
         "max_citations": 2,
-        "short_template": "Если у вас есть учёная степень (канд./д-р наук/PhD) — присваивается «педагог-модератор» без аттестации (п.32); если степени нет — проходите аттестацию по общим правилам."
+        "short_template": "Если магистратура/степень из перечня — присваивается «педагог-модератор» без аттестации (п.32); иначе — по общим правилам."
     },
     "exemption_retirement": {
         "primary":   [("30","")],
         "secondary": [("57","")],
         "max_citations": 2,
-        "short_template": "Зависит: если до пенсии ≤ 4 лет — освобождение от процедуры (п.30); если уже пенсионер и продолжаете работать — действует особый порядок (п.57).",
-        "long_template": "Если до достижения пенсионного возраста осталось ≤ 4 лет, вы освобождаетесь от прохождения процедуры аттестации; имеющаяся категория сохраняется до наступления пенсии (п.30). Если вы уже достигли пенсионного возраста и продолжаете работать, применяется порядок п.57 (как правило, освобождение от ОЗП и проведение комплексного обобщения результатов деятельности)."
+        "short_template": "Зависит: если до пенсии ≤ 4 лет — освобождение от процедуры (п.30); если уже пенсионер и продолжаете работать — особый порядок (п.57).",
+        "long_template": "Если до достижения пенсионного возраста осталось ≤ 4 лет, освобождение от процедуры аттестации; категория сохраняется до наступления пенсии (п.30). Если уже достигли пенсионного возраста и продолжаете работать — применяется порядок п.57 (обычно без ОЗП, с обобщением результатов)."
     },
     "general": {
         "primary": [],
@@ -735,12 +737,14 @@ def call_with_retries(fn, max_attempts=3, base_delay=1.0, *args, **kwargs):
     for attempt in range(1, max_attempts + 1):
         try:
             return fn(*args, **kwargs)
-        except (RateLimitError, APITimeoutError, APIConnectionError, APIStatusError) as e:
+        except (APIError, APITimeoutError, APIConnectionError, RateLimitError) as e:
             if attempt == max_attempts:
                 raise
             sleep_s = base_delay * (2 ** (attempt - 1)) + (0.1 * attempt)
-            logger.warning("OpenAI call failed (%s). Retry %d/%d in %.1fs", type(e).__name__, attempt, max_attempts, sleep_s)
+            logger.warning("OpenAI call failed (%s). Retry %d/%d in %.1fs",
+                           type(e).__name__, attempt, max_attempts, sleep_s)
             time.sleep(sleep_s)
+
 
 # ─────────────────── Переформулировки запроса ───────────────────
 
@@ -1126,11 +1130,13 @@ def narrow_punkts_by_intent(question: str, punkts: List[Dict[str, Any]]) -> List
     def _sp(p): return str(p.get("subpunkt_num","")).strip()
 
     if intent == "commission":
-        keys = ("комисси", "состав", "члены комис")
-        keep = [p for p in punkts if any(k in (p.get("text","").lower()) for k in keys)]
-        p63 = [p for p in punkts if _pn(p) == "63"]
-        keep = (p63 + keep) if p63 else keep
-        return (keep or punkts)[:12]
+        # ⬅️ Приоритетно: п.21 (нечётное число, ≥7), затем п.20 (состав/формирование)
+        p21 = [p for p in punkts if _pn(p) == "21"]
+        p20 = [p for p in punkts if _pn(p) == "20"]
+        keys = ("в состав комис", "состав аттестацион", "члены комис", "комиссия формируется", "комисси")
+        rest = [p for p in punkts if any(k in (p.get("text","").lower().replace("ё","е")) for k in keys)
+                and p not in (p21 + p20)]
+        return (p21 + p20 + rest)[:12] or punkts[:12]
 
     if intent == "fee":
         keep41 = [p for p in punkts if _pn(p) == "41"]
@@ -1138,12 +1144,11 @@ def narrow_punkts_by_intent(question: str, punkts: List[Dict[str, Any]]) -> List
         return (keep41 + keep10 + [p for p in punkts if p not in keep41][:6])[:12] or punkts[:12]
 
     if intent == "publications":
-        # Сначала п.5.x, затем остальные «п.5», затем один п.10
         head = []
         if cat:
             pn_c, sp_c = CAT_CANON.get(cat, ("",""))
             head = [p for p in punkts if _pn(p)=="5" and _sp(p)==sp_c]
-        five = [p for p in punkts if _pn(p)=="5" and p not in head][:6]
+        five = [p for p in punkts if _pn(p)=="5" and p not in head][:6]  # ⬅️ гарантируем п.5
         ten  = [p for p in punkts if _pn(p)=="10"][:1]
         return (head + five + ten)[:12] or punkts[:12]
 
@@ -1163,14 +1168,12 @@ def narrow_punkts_by_intent(question: str, punkts: List[Dict[str, Any]]) -> List
         return (p39 + p10 + [p for p in punkts if p not in p39][:6])[:12] or punkts[:12]
 
     if intent == "exemption_retirement":
-        # хотим видеть п.30 и п.57 в приоритете
         p30 = [p for p in punkts if _pn(p)=="30"]
         p57 = [p for p in punkts if _pn(p)=="57"]
         rest = [p for p in punkts if p not in (p30 + p57)]
         return (p30 + p57 + rest)[:12] or punkts[:12]
 
     if intent == "category_requirements":
-        # в начало — канонический п.5.x по категории; затем любые другие п.5; затем п.10 и, опционально, п.39
         keep = []
         if cat:
             pn_c, sp_c = CAT_CANON.get(cat, ("",""))
@@ -1178,13 +1181,10 @@ def narrow_punkts_by_intent(question: str, punkts: List[Dict[str, Any]]) -> List
         keep += [p for p in punkts if _pn(p)=="5" and p not in keep][:6]
         keep += [p for p in punkts if _pn(p)=="10"][:1]
         keep += [p for p in punkts if _pn(p)=="39"][:1]
-        # добиваем до 12
         keep += [p for p in punkts if p not in keep]
         return keep[:12]
 
     return punkts[:12]
-
-
 def ask_llm(question: str, punkts: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Строит строгий JSON-ответ на основе фрагментов Правил, с пост-коэрсией схемы.
@@ -1456,65 +1456,6 @@ def ask_llm(question: str, punkts: List[Dict[str, Any]]) -> Dict[str, Any]:
     return data
 
 
-
-def enforce_short_answer(question: str, data: dict, ctx_text: str) -> dict:
-    import re
-    sa = (data.get("short_answer") or "").strip()
-    cites = {str(c.get("punkt_num","")) for c in (data.get("citations") or [])}
-    ql = (question or "").lower()
-    ctx = (ctx_text or "").lower()
-
-    # детектор категории по синонимам
-    def _is_category_q(q: str) -> bool:
-        qn = q.replace("ё","е")
-        for _, syns in CATEGORY_SYNONYMS.items():
-            if any(s in qn for s in syns):
-                return True
-        return False
-
-    foreign_trigger = any(t in ql for t in ("магист", "за рубеж", "зарубеж", "иностран", "болаш", "nazarbayev"))
-    is_category_q = _is_category_q(ql)
-
-    # Если есть льгота (п.32 в цитатах) и вопрос про зарубеж — строгий шаблон
-    if foreign_trigger and ("32" in cites or "без прохождения процедуры аттестации" in ctx):
-        sa = ("Зависит: если магистратура окончена в зарубежной организации из перечня «Болашақ», "
-              "категория «педагог-модератор» присваивается без аттестации; иначе — по общим правилам.")
-    else:
-        if is_category_q and not sa.lower().startswith(("по общим правилам:", "зависит:")):
-            sa = "По общим правилам: " + sa
-
-    # Нормализуем односложные ответы
-    if re.fullmatch(r"\s*(да|нет)[\.\!]*\s*", sa, flags=re.I):
-        sa = "По общим правилам: " + sa.capitalize()
-
-    # Убираем жёсткие «обязан/обязательно», если в цитатах есть 3/41
-    bad = {"3","41"}
-    if (cites & bad):
-        sa = re.sub(r"\b(обязан|обязательно|должен|необходимо)\b", "требуется по общим нормам", sa, flags=re.I)
-
-    # Если вопрос про категорию и среди цитат есть п.10 — добавим этапы (если влезают в лимит)
-    if is_category_q and "10" in cites and "→" not in sa:
-        tail = " (этапы: заявление → портфолио → ОЗП → обобщение → решение комиссии)"
-        if len(sa) + len(tail) <= 200:
-            sa += tail
-    # Если категория — добавим ссылку на канонический подпункт, если влезает
-    if is_category_q:
-        target = None
-        for key, syns in CATEGORY_SYNONYMS.items():
-            if any(s in ql for s in syns):
-                target = key
-                break
-        if target:
-            pn, sp = CAT_CANON.get(target, ("",""))
-            tag = f" (см. п. {pn}.{sp})" if pn and sp else ""
-            if tag and "см. п." not in sa and len(sa) + len(tag) <= 200:
-                sa += tag
-
-
-    data["short_answer"] = sa[:200]
-    return data
-
-
 # ───────────────────── Пост-процесс и рендер ────────────────────
 
 def _collapse_repeats(text: str) -> str:
@@ -1677,23 +1618,18 @@ def filter_citations_by_question(
         snippet = snippet.lstrip(" ;,.:—-–•").rstrip(" ,;:")
         return snippet[:width] + ("…" if len(snippet) > width else "")
 
-    # по умолчанию не считаем п.3/п.41 доказательством «обязанности»; для fee п.41 разрешён
     remove = {"3"} if intent == "fee" else {"3","41"}
-    clean = [c for c in citations if str(c.get("punkt_num","")).strip() not in remove]
-    if not clean:
-        clean = citations[:]
+    clean = [c for c in citations if str(c.get("punkt_num","")).strip() not in remove] or citations[:]
 
-    # Не тащим п.39, если вопрос не про порог/категории
     if intent not in {"threshold", "category_requirements"}:
         clean = [c for c in clean if str(c.get("punkt_num","")).strip() != "39"]
 
-    # Иностр. образование
     if intent == "exemption_foreign":
         p32 = [c for c in clean if str(c.get("punkt_num","")).strip() == "32"]
         rest = [c for c in clean if str(c.get("punkt_num","")).strip() != "32"]
-        ordered = p32 + rest
-        out = (ordered[:2] or clean[:2])
-        pref_terms = ("учен", "учёная", "степен", "phd", "кандид", "доктор", "перечень рекомендованных", "nazarbayev", "болаш", "без прохождения")
+        out = (p32 + rest)[:2] or clean[:2]
+        pref_terms = ("учен", "учёная", "степен", "phd", "кандид", "доктор",
+                      "перечень рекомендованных", "nazarbayev", "болаш", "без прохождения")
         for c in out:
             k = (str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip())
             base_full = by_key_full.get(k, "")
@@ -1701,7 +1637,6 @@ def filter_citations_by_question(
                 c["quote"] = _collapse_repeats(_crop_around(base_full, pref_terms, width=QUOTE_WIDTH_DEFAULT))
         return out
 
-    # Пенсионные кейсы
     if intent == "exemption_retirement":
         p30 = [c for c in clean if str(c.get("punkt_num","")).strip() == "30"]
         p57 = [c for c in clean if str(c.get("punkt_num","")).strip() == "57"]
@@ -1711,10 +1646,24 @@ def filter_citations_by_question(
             k = (str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip())
             base_full = by_key_full.get(k, "")
             if base_full:
-                c["quote"] = _collapse_repeats(_crop_around(base_full, ("пенсион","освобожда","обобщен","озп"), width=QUOTE_WIDTH_DEFAULT))
+                c["quote"] = _collapse_repeats(_crop_around(base_full, ("пенсион","освобожда","обобщен","озп"),
+                                                            width=QUOTE_WIDTH_DEFAULT))
         return out
 
-    # Категории
+    # ⬇️ Комиссия: жёсткий приоритет 21 → 20
+    if intent == "commission":
+        ordered = [c for c in clean if str(c.get("punkt_num","")).strip() in {"21","20"}]
+        rest = [c for c in clean if c not in ordered]
+        out = (ordered + rest)[:2]
+        keys_comm = ("состав", "комисси", "нечетн", "семи", "7", "члены комис", "формируется")
+        for c in out:
+            k = (str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip())
+            base_full = by_key_full.get(k, "")
+            if base_full:
+                c["quote"] = _collapse_repeats(_crop_around(base_full, keys_comm, width=QUOTE_WIDTH_DEFAULT))
+        return out
+
+    # Категории — оставляю твой сильный блок без изменений
     target = None
     for key, syns in CATEGORY_SYNONYMS.items():
         if any(s in ql for s in syns):
@@ -1735,7 +1684,6 @@ def filter_citations_by_question(
         clean.sort(key=_ord)
         out = clean[:3]
 
-        # добить п.10/п.39, если их не оказалось
         have = {(str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip()) for c in out}
         for add_pn in ("10","39"):
             if not any(h[0] == add_pn for h in have):
@@ -1744,11 +1692,7 @@ def filter_citations_by_question(
                         out.append({"punkt_num": kpn, "subpunkt_num": ksp, "quote": ""}); break
 
         human = CATEGORY_LABEL.get(target, target)
-        cat_keys = (
-            f"педагог-{target}", f"педагог {target}",
-            f"педагог-{human}",  f"педагог {human}",
-            target, human
-        )
+        cat_keys = (f"педагог-{target}", f"педагог {target}", f"педагог-{human}", f"педагог {human}", target, human)
 
         for c in out:
             key = (str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip())
@@ -1781,7 +1725,6 @@ def filter_citations_by_question(
                 c["quote"] = _collapse_repeats(_crop_around(base_full, tuple(), width=QUOTE_WIDTH_DEFAULT))
         return out[:3]
 
-    # Публикации
     if intent == "publications":
         out = clean[:2]
         keys_pub = ("публикац","журнал","стат","scopus","web of science","wos","doi","индексир","рекомендован")
@@ -1789,20 +1732,20 @@ def filter_citations_by_question(
             key = (str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip())
             base_full = by_key_full.get(key, "")
             if base_full:
-                c["quote"] = _collapse_repeats(_crop_around(base_full, keys_pub, width=QUOTE_WIDTH_DEFAULT if key[0]!="5" else QUOTE_WIDTH_LONG))
+                width = QUOTE_WIDTH_LONG if key[0] == "5" else QUOTE_WIDTH_DEFAULT
+                c["quote"] = _collapse_repeats(_crop_around(base_full, keys_pub, width=width))
         return out
 
-    # Плата
     if intent == "fee":
         out = clean[:2]
         for c in out:
             key = (str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip())
             base_full = by_key_full.get(key, "")
             if base_full:
-                c["quote"] = _collapse_repeats(_crop_around(base_full, ("оплат","плат", "стоимост", "бесплат"), width=QUOTE_WIDTH_DEFAULT))
+                c["quote"] = _collapse_repeats(_crop_around(base_full, ("оплат","плат", "стоимост", "бесплат"),
+                                                            width=QUOTE_WIDTH_DEFAULT))
         return out
 
-    # По умолчанию
     out = clean[:3]
     for c in out:
         key = (str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip())
