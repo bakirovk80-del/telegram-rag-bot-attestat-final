@@ -156,6 +156,11 @@ CATEGORY_SYNONYMS = {
     "эксперт":      ("эксперт", "expert", "ekspert"),
     "мастер":       ("мастер", "master"),
 }
+# ⬇️ ADD BLOCK: явные триггеры "это вопрос про требования категории"
+CATEGORY_TRIGGERS = (
+    "что нужно", "как стать", "что бы стать", "что чтобы", "требован", "критери",
+    "критерии", "балл", "баллы", "портфолио", "компетенц", "условия", "должен соответствовать"
+)
 
 # человекочитаемые подписи для вывода
 CATEGORY_LABEL = {
@@ -211,52 +216,58 @@ def _detect_category_key(q: str) -> Optional[str]:
             return key
     return None
 
+# ⬇️ REPLACE BLOCK: classify_question()
 def classify_question(q: str) -> Dict[str, Any]:
     ql = (q or "").lower().replace("ё","е")
     cat = _detect_category_key(ql)
 
-    # 1) Пенсионные/возрастные кейсы — самый высокий приоритет
+    # Спец: возраст/пенсия
     if any(k in ql for k in INTENT_KEYWORDS["exemption_retirement"]):
         return {"intent": "exemption_retirement", "category": None, "confidence": 0.9}
-    # одно спец-правило: если есть возраст/годы и упомянута аттестация — тоже пенсионный кейс
-    if re.search(r"\b\d+\s*(?:год|лет|года)\b", ql) and "аттест" in ql:
+    if ("возраст" in ql or re.search(r"\b\d+\s*(?:год|лет|года)\b", ql)) and "аттест" in ql:
         return {"intent": "exemption_retirement", "category": None, "confidence": 0.9}
 
-    # 2) Зарубежные/льготные по образованию
+    # Спец: «можно ли не проходить аттестацию» → трактуем как вопрос об освобождении (п.30/п.57), а не о пороге
+    if ("не проход" in ql or "освобож" in ql) and "аттест" in ql:
+        return {"intent": "exemption_retirement", "category": None, "confidence": 0.8}
+
+    # Иностранные/льготные основания (п.32)
     if any(k in ql for k in INTENT_KEYWORDS["exemption_foreign"]):
         return {"intent": "exemption_foreign", "category": None, "confidence": 0.9}
 
-    # 3) Денежные вопросы
+    # Платность/бесплатность
     if any(k in ql for k in INTENT_KEYWORDS["fee"]):
         return {"intent": "fee", "category": None, "confidence": 0.9}
 
-    # 4) Периодичность
+    # Периодичность
     if any(k in ql for k in INTENT_KEYWORDS["periodicity"]):
         return {"intent": "periodicity", "category": None, "confidence": 0.85}
 
-    # 5) Комиссия
+    # Комиссия
     if any(k in ql for k in INTENT_KEYWORDS["commission"]):
         return {"intent": "commission", "category": None, "confidence": 0.85}
 
-    # 6) Публикации
+    # >>> ВАЖНО: если есть упоминание категории И (что нужно/требования/критерии/портфолио/и т.п.) — это точно про требования категории
+    if cat and any(t in ql for t in CATEGORY_TRIGGERS):
+        return {"intent": "category_requirements", "category": cat, "confidence": 0.9}
+
+    # Публикации (если нет явного «вопроса о требованиях к категории»)
     if any(k in ql for k in INTENT_KEYWORDS["publications"]):
         return {"intent": "publications", "category": None, "confidence": 0.8}
 
-    # 7) Порог/ОЗП
+    # Порог ОЗП
     if any(k in ql for k in INTENT_KEYWORDS["threshold"]):
         return {"intent": "threshold", "category": cat, "confidence": 0.9}
 
-    # 8) Конкретная категория
+    # Прочее: если категория всё-таки распознана — это про требования
     if cat:
         return {"intent": "category_requirements", "category": cat, "confidence": 0.85}
 
-    # 9) Процедура
+    # Процедура
     if any(k in ql for k in INTENT_KEYWORDS["procedure"]):
         return {"intent": "procedure", "category": None, "confidence": 0.75}
 
-    # 10) Общее
     return {"intent": "general", "category": None, "confidence": 0.5}
-
 # ───────── Политики ответов и обязательные пункты ─────────
 POLICIES = {
     "threshold": {
@@ -1105,6 +1116,7 @@ def llm_rerank(question: str, punkts: List[Dict[str, Any]], top_n: int = 12) -> 
         return out or punkts[:top_n]
     except Exception:
         return punkts[:top_n]
+# ⬇️ REPLACE BLOCK: narrow_punkts_by_intent()
 def narrow_punkts_by_intent(question: str, punkts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     info = classify_question(question)
     intent = info.get("intent", "general")
@@ -1114,17 +1126,11 @@ def narrow_punkts_by_intent(question: str, punkts: List[Dict[str, Any]]) -> List
     def _sp(p): return str(p.get("subpunkt_num","")).strip()
 
     if intent == "commission":
-        # Отбираем пункты, где прямо говорится о составе/формировании комиссии
-        keys = ("в состав комиссии", "состав аттестационной комиссии", "комиссия формируется", "члены комис")
-        keep = []
-        for p in punkts:
-            tl = (p.get("text","") or "").lower().replace("ё","е")
-            if any(k in tl for k in keys):
-                keep.append(p)
+        keys = ("комисси", "состав", "члены комис")
+        keep = [p for p in punkts if any(k in (p.get("text","").lower()) for k in keys)]
+        p63 = [p for p in punkts if _pn(p) == "63"]
+        keep = (p63 + keep) if p63 else keep
         return (keep or punkts)[:12]
-
-
-
 
     if intent == "fee":
         keep41 = [p for p in punkts if _pn(p) == "41"]
@@ -1132,10 +1138,11 @@ def narrow_punkts_by_intent(question: str, punkts: List[Dict[str, Any]]) -> List
         return (keep41 + keep10 + [p for p in punkts if p not in keep41][:6])[:12] or punkts[:12]
 
     if intent == "publications":
-        cat_pair = CAT_CANON.get(cat or "", ("",""))
+        # Сначала п.5.x, затем остальные «п.5», затем один п.10
         head = []
-        if cat_pair[0]:
-            head = [p for p in punkts if _pn(p)=="5" and _sp(p)==cat_pair[1]]
+        if cat:
+            pn_c, sp_c = CAT_CANON.get(cat, ("",""))
+            head = [p for p in punkts if _pn(p)=="5" and _sp(p)==sp_c]
         five = [p for p in punkts if _pn(p)=="5" and p not in head][:6]
         ten  = [p for p in punkts if _pn(p)=="10"][:1]
         return (head + five + ten)[:12] or punkts[:12]
@@ -1154,6 +1161,26 @@ def narrow_punkts_by_intent(question: str, punkts: List[Dict[str, Any]]) -> List
         p39 = [p for p in punkts if _pn(p)=="39"]
         p10 = [p for p in punkts if _pn(p)=="10"][:1]
         return (p39 + p10 + [p for p in punkts if p not in p39][:6])[:12] or punkts[:12]
+
+    if intent == "exemption_retirement":
+        # хотим видеть п.30 и п.57 в приоритете
+        p30 = [p for p in punkts if _pn(p)=="30"]
+        p57 = [p for p in punkts if _pn(p)=="57"]
+        rest = [p for p in punkts if p not in (p30 + p57)]
+        return (p30 + p57 + rest)[:12] or punkts[:12]
+
+    if intent == "category_requirements":
+        # в начало — канонический п.5.x по категории; затем любые другие п.5; затем п.10 и, опционально, п.39
+        keep = []
+        if cat:
+            pn_c, sp_c = CAT_CANON.get(cat, ("",""))
+            keep += [p for p in punkts if _pn(p)=="5" and _sp(p)==sp_c]
+        keep += [p for p in punkts if _pn(p)=="5" and p not in keep][:6]
+        keep += [p for p in punkts if _pn(p)=="10"][:1]
+        keep += [p for p in punkts if _pn(p)=="39"][:1]
+        # добиваем до 12
+        keep += [p for p in punkts if p not in keep]
+        return keep[:12]
 
     return punkts[:12]
 
@@ -1613,6 +1640,7 @@ def _ensure_category_citation(question: str,
     return citations
 
 # ── Фильтрация цитат по ключевым словам из вопроса ──
+# ⬇️ REPLACE BLOCK: filter_citations_by_question()
 def filter_citations_by_question(
     question: str,
     citations: List[Dict[str, Any]],
@@ -1649,64 +1677,52 @@ def filter_citations_by_question(
         snippet = snippet.lstrip(" ;,.:—-–•").rstrip(" ,;:")
         return snippet[:width] + ("…" if len(snippet) > width else "")
 
-    # remove 3/(41) — для fee оставляем 41
+    # по умолчанию не считаем п.3/п.41 доказательством «обязанности»; для fee п.41 разрешён
     remove = {"3"} if intent == "fee" else {"3","41"}
     clean = [c for c in citations if str(c.get("punkt_num","")).strip() not in remove]
     if not clean:
         clean = citations[:]
 
-
-    # 🔽 ДОБАВИТЬ: не тащим п.39, если вопрос не про порог/категории
+    # Не тащим п.39, если вопрос не про порог/категории
     if intent not in {"threshold", "category_requirements"}:
-        clean = [
-            c for c in clean
-            if str(c.get("punkt_num","")).strip() != "39"
-               or any(k in ql for k in KW_OZP_TERMS)
-        ]
-    # 🔼
+        clean = [c for c in clean if str(c.get("punkt_num","")).strip() != "39"]
 
-    # foreign?
+    # Иностр. образование
     if intent == "exemption_foreign":
         p32 = [c for c in clean if str(c.get("punkt_num","")).strip() == "32"]
         rest = [c for c in clean if str(c.get("punkt_num","")).strip() != "32"]
-        pref_terms = ("учен", "учёная", "степен", "phd", "кандид", "доктор", "перечень рекомендованных", "nazarbayev", "болаш", "без прохождения")
         ordered = p32 + rest
         out = (ordered[:2] or clean[:2])
+        pref_terms = ("учен", "учёная", "степен", "phd", "кандид", "доктор", "перечень рекомендованных", "nazarbayev", "болаш", "без прохождения")
         for c in out:
-            key = (str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip())
-            base_full = by_key_full.get(key, "")
+            k = (str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip())
+            base_full = by_key_full.get(k, "")
             if base_full:
                 c["quote"] = _collapse_repeats(_crop_around(base_full, pref_terms, width=QUOTE_WIDTH_DEFAULT))
         return out
 
-    # retirement?
+    # Пенсионные кейсы
     if intent == "exemption_retirement":
         p30 = [c for c in clean if str(c.get("punkt_num","")).strip() == "30"]
         p57 = [c for c in clean if str(c.get("punkt_num","")).strip() == "57"]
         rest = [c for c in clean if c not in (p30 + p57)]
         out = (p30 + p57 + rest)[:2]
         for c in out:
-            key = (str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip())
-            base_full = by_key_full.get(key, "")
+            k = (str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip())
+            base_full = by_key_full.get(k, "")
             if base_full:
-                # добавили «четыр»/«4 » чтобы в цитату попадала сама цифра — санитайзер её не вырежет
-                c["quote"] = _collapse_repeats(_crop_around(
-                    base_full,
-                    ("пенсион", "освобожда", "обобщен", "озп", "четыр", " 4 "),
-                    width=QUOTE_WIDTH_DEFAULT
-                ))
+                c["quote"] = _collapse_repeats(_crop_around(base_full, ("пенсион","освобожда","обобщен","озп"), width=QUOTE_WIDTH_DEFAULT))
         return out
 
-
-    # category?
+    # Категории
     target = None
     for key, syns in CATEGORY_SYNONYMS.items():
         if any(s in ql for s in syns):
-            target = key
-            break
+            target = key; break
 
     if target:
         canon_sp = CAT_CANON.get(target, ("",""))[1]
+
         def _ord(c):
             pn = str(c.get("punkt_num","")).strip()
             sp = str(c.get("subpunkt_num","")).strip()
@@ -1719,19 +1735,20 @@ def filter_citations_by_question(
         clean.sort(key=_ord)
         out = clean[:3]
 
+        # добить п.10/п.39, если их не оказалось
         have = {(str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip()) for c in out}
-        for pn in ("10","39"):
-            if not any(h[0] == pn for h in have):
+        for add_pn in ("10","39"):
+            if not any(h[0] == add_pn for h in have):
                 for (kpn, ksp), txt in by_key_full.items():
-                    if kpn == pn:
+                    if kpn == add_pn:
                         out.append({"punkt_num": kpn, "subpunkt_num": ksp, "quote": ""}); break
 
         human = CATEGORY_LABEL.get(target, target)
-        cat_keys = tuple({
+        cat_keys = (
             f"педагог-{target}", f"педагог {target}",
-            f"педагог-{human}", f"педагог {human}",
+            f"педагог-{human}",  f"педагог {human}",
             target, human
-        })
+        )
 
         for c in out:
             key = (str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip())
@@ -1763,23 +1780,19 @@ def filter_citations_by_question(
             else:
                 c["quote"] = _collapse_repeats(_crop_around(base_full, tuple(), width=QUOTE_WIDTH_DEFAULT))
         return out[:3]
-        # publications?
+
+    # Публикации
     if intent == "publications":
-        # приоритезируем п.5.x, затем прочее
-        p5 = [c for c in clean if str(c.get("punkt_num","")).strip() == "5"]
-        rest = [c for c in clean if c not in p5]
-        ordered = (p5 + rest)[:2]
+        out = clean[:2]
         keys_pub = ("публикац","журнал","стат","scopus","web of science","wos","doi","индексир","рекомендован")
-        for c in ordered:
+        for c in out:
             key = (str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip())
             base_full = by_key_full.get(key, "")
             if base_full:
-                width = QUOTE_WIDTH_LONG if key[0] == "5" else QUOTE_WIDTH_DEFAULT
-                c["quote"] = _collapse_repeats(_crop_around(base_full, keys_pub, width=width))
-        return ordered
+                c["quote"] = _collapse_repeats(_crop_around(base_full, keys_pub, width=QUOTE_WIDTH_DEFAULT if key[0]!="5" else QUOTE_WIDTH_LONG))
+        return out
 
-
-    # fee — просто до 2 релевантных, не выкидывая 41
+    # Плата
     if intent == "fee":
         out = clean[:2]
         for c in out:
@@ -1789,7 +1802,7 @@ def filter_citations_by_question(
                 c["quote"] = _collapse_repeats(_crop_around(base_full, ("оплат","плат", "стоимост", "бесплат"), width=QUOTE_WIDTH_DEFAULT))
         return out
 
-    # default
+    # По умолчанию
     out = clean[:3]
     for c in out:
         key = (str(c.get("punkt_num","")).strip(), str(c.get("subpunkt_num","")).strip())
@@ -1797,8 +1810,7 @@ def filter_citations_by_question(
         if base_full:
             c["quote"] = _collapse_repeats(_crop_around(base_full, tuple(), width=QUOTE_WIDTH_DEFAULT))
     return out
-
-
+# ⬇️ REPLACE BLOCK: enforce_reasoned_answer()
 def enforce_reasoned_answer(question: str, data: Dict[str, Any], punkts: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Для вопросов про категорию:
@@ -1815,11 +1827,9 @@ def enforce_reasoned_answer(question: str, data: Dict[str, Any], punkts: List[Di
     if not target:
         return data
 
-    # человекочитаемая метка
     human = CATEGORY_LABEL.get(target, target)
-
-    # найти канонический п.5.x
     pn, sp = CAT_CANON.get(target, ("",""))
+
     base_txt = ""
     for p in punkts:
         if str(p.get("punkt_num","")).strip()==pn and str(p.get("subpunkt_num","")).strip()==sp:
@@ -1830,6 +1840,7 @@ def enforce_reasoned_answer(question: str, data: Dict[str, Any], punkts: List[Di
 
     def _bullets_from(text: str, max_items: int = 6) -> List[str]:
         t = _collapse_repeats(text)
+        # рубим по списковым разделителям и по предложениям
         parts = re.split(r"(?:\n+|•|—|\u2014|;|\.\s+|\d+\)|\d+\.)", t)
         parts = [re.sub(r"[ \t]+"," ", s).strip(" -—•.;") for s in parts]
         parts = [s for s in parts if 20 <= len(s) <= 240]
@@ -1840,6 +1851,10 @@ def enforce_reasoned_answer(question: str, data: Dict[str, Any], punkts: List[Di
                 seen.add(key); uniq.append(s)
             if len(uniq) >= max_items:
                 break
+        # если вдруг пусто — возьмем первые два длинных предложения
+        if not uniq:
+            sents = re.split(r"(?<=[\.\!\?])\s+", t)
+            uniq = [s.strip() for s in sents if len(s.strip())>30][:max_items]
         return uniq[:max_items]
 
     bullets = _bullets_from(base_txt)
@@ -1860,6 +1875,7 @@ def enforce_reasoned_answer(question: str, data: Dict[str, Any], punkts: List[Di
     else:
         data["reasoned_answer"] = current + "\n\n" + "\n".join(lines)
     return data
+
 # 1) Общий экстрактор процента порога из п.39 (fallback для любых категорий)
 def extract_threshold_percent_from_p39(punkts: List[Dict[str, Any]]) -> Optional[str]:
     """
